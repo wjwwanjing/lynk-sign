@@ -385,8 +385,8 @@ function shareReport(token, contentId, shareCode) {
 
 // —— 单步自助分享（实验性）——
 // 用主账号自身的 token 直接调 shareReporting，让服务器认为"已分享且有人点击"。
-// 由于该端点未经充分验证，这里自动尝试多种参数/方法组合，哪个返回成功/已分享即用哪个。
-// 会把每次尝试的 URL 和响应打印到日志，便于真机排查。
+// 实测有效组合（优先）：POST /app/v1/task/shareReporting?shareCode=xxx&contentId=xxx
+// 同时保留其他组合作为 fallback，并把每次尝试结果打印到日志便于排查。
 async function shareReportingSingle(token, shareCode, contentId) {
   var attempts = [
     { name: "POST_query", method: "POST", path: "/app/v1/task/shareReporting", params: { shareCode: shareCode, contentId: contentId } },

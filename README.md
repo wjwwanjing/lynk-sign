@@ -178,18 +178,24 @@ lynk_token_b = bearerB账号1的refreshToken,bearerB账号2的refreshToken
 
 ### 方式 B：单步自助分享（不配小号，实验性）⚠️
 
-**没配 `lynk_token_b` 时**，脚本会用**主账号自身**直接调单步接口：
+**没配 `lynk_token_b` 时**，脚本会尝试用**主账号自身**直接调单步接口，让服务器认为"已分享且有人点击"，从而给主账号加分——**无需任何小号**。
+
+脚本会优先使用已验证的组合，若失败再 fallback 到其他组合：
 
 ```
-GET /app/v1/task/shareReporting?shareCode=<主账号自己的shareCode>
+POST /app/v1/task/shareReporting?shareCode=<shareCode>&contentId=<cid>   ← 已实测成功
+POST /app/v1/task/shareReporting {shareCode, contentId}
+GET  /app/v1/task/shareReporting?shareCode=<shareCode>&contentId=<cid>
+GET  /app/v1/task/shareReporting?shareCode=<shareCode>
 ```
 
-想让服务器直接认为"已分享且有人点击"，从而给主账号加分——**无需任何小号**。
+只要任意一种返回成功/已分享，即停止并视为完成。
 
 - 开关：`lynk_self_share`，默认 `"1"`（开启）；设 `"0"` 关闭。
-- 通知里以 `---自助分享(单步)---` 展示结果（`OK 成功` / `FAIL <原因>`）。
+- 通知里以 `---自助分享(单步)---` 展示最终结果（`OK 成功` / `FAIL <原因>`）。
+- 运行日志（QX 脚本日志）会打印每次尝试的 `code` 和 `msg`，方便定位具体哪种方式被服务器接受。
 
-> ⚠️ **诚实提示**：这个单步端点属于推测性接口，**是否真给主账号加分，官方后端可能校验"不能给自己的分享点赞"而拒绝**。请**跑一次后看通知结果 + 到 APP 里核对能量体有没有真的增加**来确认。若显示 FAIL 或能量体没涨，说明这条对你的账号无效，请改用方式 A（配小号三步）或手动把分享链接发给真人点击。
+> ⚠️ **诚实提示**：这个单步端点属于推测性接口，**是否真给主账号加分，官方后端可能校验"不能给自己的分享点赞"而拒绝**。请**跑一次后看通知结果 + 到 APP 里核对能量体有没有真的增加**来确认。若 4 种尝试全部 FAIL 或能量体没涨，说明这条对你的账号无效，请改用方式 A（配小号三步）或手动把分享链接发给真人点击。
 
 > 两种方式互斥：**配了小号走 A，没配小号走 B**。都不想用就把 `lynk_self_share` 设 `"0"`，脚本仍会生成分享链接供你手动复制发人点击。
 
