@@ -14,8 +14,11 @@
  *   -------------------------  ---------------------------------
  *   lynk_refresh_token        主账号 refreshToken（28 天有效，自动续期）
  *   lynk_device_id            设备 ID（抓包请求头 gl_dev_id）
- *   lynk_token_b             B 账号 refreshToken，逗号分隔多个（可选，用于自动分享）
+ *   lynk_token_b             B 账号 refreshToken，逗号分隔多个（可选，用于三步自动分享）
  *   lynk_share_cid           分享文章 ID（可选，默认热门 ID）
+ *   lynk_self_share          单步自助分享开关（"1"开/"0"关，默认开）：
+ *                            没配小号时，用主账号自身调 shareReporting 上报，
+ *                            让系统认为"已分享且有人点击"。实验性——是否真加分需真机验证。
  *
  * ============================================================
  *  QX 定时任务（长按底部风车 → 配置文件 → [task_local] 段）
@@ -36,8 +39,9 @@
 const CONFIG = {
   REFRESH_TOKEN: "",   // 主账号 refreshToken，形如 bearer<uuid>
   DEVICE_ID:     "",   // 设备 ID
-  TOKEN_B:      "",   // B 账号 refreshToken，多个用逗号分隔；留空=不启用自动分享
+  TOKEN_B:      "",   // B 账号 refreshToken，多个用逗号分隔；留空=不启用三步分享
   SHARE_CID:    "2072260486405246976", // 分享文章 ID
+  SELF_SHARE:   "1",  // 单步自助分享开关："1"开/"0"关；没配小号时用主账号自身上报（实验性）
 };
 
 // 方法二：QX 偏好设置读取（有值则覆盖上面的 CONFIG）
@@ -45,6 +49,13 @@ const REFRESH_TOKEN = $prefs.valueForKey("lynk_refresh_token") || CONFIG.REFRESH
 const DEVICE_ID     = $prefs.valueForKey("lynk_device_id")     || CONFIG.DEVICE_ID     || "";
 const TOKEN_B_RAW   = $prefs.valueForKey("lynk_token_b")       || CONFIG.TOKEN_B      || "";
 const SHARE_CID     = $prefs.valueForKey("lynk_share_cid")     || CONFIG.SHARE_CID   || "2072260486405246976";
+const SELF_SHARE    = String($prefs.valueForKey("lynk_self_share") || CONFIG.SELF_SHARE || "1");
+
+// 单步自助分享是否开启
+function selfShareEnabled() {
+  var v = SELF_SHARE.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "on" || v === "yes";
+}
 
 // ===================== 常量（领克 APP 自带的网关公开参数，抓包即可见，非任何个人授权）=====================
 const API_BASE   = "https://app-api-gw-toc.lynkco.com";
@@ -372,6 +383,14 @@ function shareReport(token, contentId, shareCode) {
   return apiPost("/app/v1/task/shareContentContectReporting", token, { contentId: contentId, shareCode: shareCode });
 }
 
+// —— 单步自助分享（实验性）——
+// 用主账号自身的 token 直接调 shareReporting?shareCode=<自己的shareCode>，
+// 让服务器认为"已分享且有人点击"，从而给主账号加分。无需配置小号。
+// 注意：这是原精简版猜测的接口，是否真加分需在真机上看通知里的结果确认。
+function shareReportingSingle(token, shareCode) {
+  return apiGet("/app/v1/task/shareReporting", token, { shareCode: shareCode });
+}
+
 // ===================== 主流程 =====================
 
 async function main() {
@@ -527,6 +546,26 @@ async function main() {
     log("跳过自动分享: 未获取到 shareCode");
   }
 
+  // 5b. 单步自助分享（无需小号）：仅当没配 B 账号、开关开启、且拿到 shareCode 时执行
+  var selfShareResult = null;
+  if (tokenBList.length === 0 && selfShareEnabled() && shareCode) {
+    log("尝试单步自助分享 (无需小号)");
+    var ssr = await shareReportingSingle(token, shareCode);
+    var scode = String(ssr.code);
+    var smsg = ssr.message || "";
+    if (scode === "200" || scode === "success") {
+      selfShareResult = { ok: true, msg: "成功" };
+      log("单步自助分享成功");
+    } else if (smsg.indexOf("已分享") >= 0 || smsg.indexOf("已领取") >= 0 ||
+               smsg.indexOf("今日已") >= 0 || smsg.indexOf("已结束") >= 0) {
+      selfShareResult = { ok: true, msg: "今日已分享" };
+      log("单步自助分享: 今日已分享 (" + smsg + ")");
+    } else {
+      selfShareResult = { ok: false, msg: smsg || scode };
+      log("单步自助分享失败 (" + scode + " " + smsg + ")");
+    }
+  }
+
   // 6. 构造通知
   var now = new Date();
   var timeStr = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate()) + " " +
@@ -555,6 +594,10 @@ async function main() {
     shareResults.forEach(function (r) {
       lines.push("B" + r.idx + ": " + (r.ok ? "OK" : "FAIL") + " " + r.msg);
     });
+  }
+  if (selfShareResult) {
+    lines.push("---自助分享(单步)---");
+    lines.push((selfShareResult.ok ? "OK" : "FAIL") + " " + selfShareResult.msg);
   }
 
   var title = signResult.indexOf("成功") >= 0 ? "领克签到成功" : "领克签到 (" + signResult + ")";
