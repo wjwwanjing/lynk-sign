@@ -384,11 +384,42 @@ function shareReport(token, contentId, shareCode) {
 }
 
 // —— 单步自助分享（实验性）——
-// 用主账号自身的 token 直接调 shareReporting?shareCode=<自己的shareCode>，
-// 让服务器认为"已分享且有人点击"，从而给主账号加分。无需配置小号。
-// 注意：这是原精简版猜测的接口，是否真加分需在真机上看通知里的结果确认。
-function shareReportingSingle(token, shareCode) {
-  return apiGet("/app/v1/task/shareReporting", token, { shareCode: shareCode });
+// 用主账号自身的 token 直接调 shareReporting，让服务器认为"已分享且有人点击"。
+// 由于该端点未经充分验证，这里自动尝试多种参数/方法组合，哪个返回成功/已分享即用哪个。
+// 会把每次尝试的 URL 和响应打印到日志，便于真机排查。
+async function shareReportingSingle(token, shareCode, contentId) {
+  var attempts = [
+    { name: "POST_query", method: "POST", path: "/app/v1/task/shareReporting", params: { shareCode: shareCode, contentId: contentId } },
+    { name: "POST_body",  method: "POST", path: "/app/v1/task/shareReporting", params: {}, body: { shareCode: shareCode, contentId: contentId } },
+    { name: "GET_query",  method: "GET",  path: "/app/v1/task/shareReporting", params: { shareCode: shareCode, contentId: contentId } },
+    { name: "GET_only",   method: "GET",  path: "/app/v1/task/shareReporting", params: { shareCode: shareCode } },
+  ];
+
+  var lastResp = { code: "fail", message: "所有单步分享尝试均失败" };
+  for (var i = 0; i < attempts.length; i++) {
+    var a = attempts[i];
+    var resp;
+    try {
+      if (a.method === "POST") {
+        resp = await apiPost(a.path, token, a.body || {}, a.params);
+      } else {
+        resp = await apiGet(a.path, token, a.params);
+      }
+    } catch (e) {
+      resp = { code: "ERR", message: String(e) };
+    }
+    lastResp = resp;
+    log("单步分享尝试 " + a.name + ": code=" + String(resp.code) + " msg=" + String(resp.message || ""));
+
+    var code = String(resp.code);
+    var msg = resp.message || "";
+    if (code === "200" || code === "success" ||
+        msg.indexOf("已分享") >= 0 || msg.indexOf("已领取") >= 0 ||
+        msg.indexOf("今日已") >= 0 || msg.indexOf("已结束") >= 0) {
+      return resp;
+    }
+  }
+  return lastResp;
 }
 
 // ===================== 主流程 =====================
@@ -550,7 +581,7 @@ async function main() {
   var selfShareResult = null;
   if (tokenBList.length === 0 && selfShareEnabled() && shareCode) {
     log("尝试单步自助分享 (无需小号)");
-    var ssr = await shareReportingSingle(token, shareCode);
+    var ssr = await shareReportingSingle(token, shareCode, SHARE_CID);
     var scode = String(ssr.code);
     var smsg = ssr.message || "";
     if (scode === "200" || scode === "success") {
