@@ -20,8 +20,11 @@
  * ============================================================
  *  QX 定时任务（长按底部风车 → 配置文件 → [task_local] 段）
  * ============================================================
- *   0 9 * * * lynk_qx.js, tag=领克签到, enabled=true
- *   （本地脚本直接写文件名或 iCloud 路径即可，不必用 http 链接）
+ *   本地/离线：
+ *     0 9 * * * lynk_qx.js, tag=领克签到, enabled=true
+ *   远程（你自己的仓库，用 raw 原始地址，非 blob 网页地址）：
+ *     0 9 * * * https://raw.githubusercontent.com/wjwwanjing/lynk-sign/main/lynk_qx.js, tag=领克签到, enabled=true
+ *   （远程方式下 Token 请走 QX 偏好设置，不要写进 CONFIG 区）
  *
  * ============================================================
  *  抓包获取 refreshToken / device_id 的方法见 README.md

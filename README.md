@@ -68,6 +68,29 @@ App Store 购买并安装 [QuantumultX](https://apps.apple.com/app/quantumult-x/
 
 随便找一个 `app-api-gw-toc.lynkco.com` 的请求，看请求头里的 `gl_dev_id` 字段，或者从登录 URL 的 `deviceId` 参数里拿。
 
+### 2.5 自动获取 Token（推荐，免手动抓包）★
+
+不想每次手动找 `refreshToken` / `device_id`？用 QX 的「重写规则」让脚本在登录时**自动拦截并保存**，配置一次永久免维护（之后每次刷新也会静默续期）。
+
+**前提（一次性手动，绕不过）**：QX 已装好并信任 MITM CA 证书（设置 → 其他设置 → MITM → 生成证书 → 安装 → 到系统设置里信任）。这是 iOS 系统限制，任何自动化都无法免除。
+
+**步骤**：
+
+1. 把提取脚本 `lynk_token.js` 放进 QX 脚本目录（和你主脚本同目录，或用下面远程地址）。
+2. 在 QX 配置文件 `[rewrite_local]` 段加入：
+
+```ini
+[rewrite_local]
+^https?://app-services\.lynkco\.com\.cn/.*login url script-response-body https://raw.githubusercontent.com/wjwwanjing/lynk-sign/main/lynk_token.js
+```
+
+> 若脚本在本地，把末尾 URL 换成 `lynk_token.js` 文件名即可（同目录）。
+
+3. 确保 QX「重写」开关已打开（底部风车 → 重写）。
+4. 打开领克 APP **重新登录一次**（退出账号再登，或杀进程重登），拦截器会自动把 `refreshToken` 和 `device_id` 写入本地偏好，并弹一条「领克Token已自动保存」通知。之后每天自动签到时也会静默续期。
+
+> 自动获取后，下面「方法二：QX 偏好设置」里的 `lynk_refresh_token` / `lynk_device_id` **不用再手动填**；想临时覆盖仍可手动填（优先级更高）。`lynk_token_b`（B 账号）仍需手动填。
+
 ### 3. 配置脚本
 
 **方法一：直接编辑脚本**
@@ -98,10 +121,12 @@ QX → 设置 → 其他设置 → 脚本 → 找到 lynk_qx.js → 配置：
 
 ```ini
 [task_local]
-0 9 * * * https://你的地址/lynk_qx.js, tag=领克签到, enabled=true
+0 9 * * * https://raw.githubusercontent.com/wjwwanjing/lynk-sign/main/lynk_qx.js, tag=领克签到, enabled=true
 ```
 
-> 如果是本地脚本，把 URL 换成脚本的本地路径或 iCloud 路径。
+> 使用你自己的 GitHub 仓库的 **raw 原始文件地址**（注意不是 `github.com/.../blob/...` 网页地址，那个 QX 无法执行）。
+> 想完全离线 / 不依赖网络时，把地址换成本地路径或 iCloud 路径即可，例如：`0 9 * * * lynk_qx.js, tag=领克签到, enabled=true`。
+> ⚠️ 用远程地址时，**Token 一定要走 QX 偏好设置（方法二），千万别写进脚本顶部的 CONFIG 区**——否则脚本提交到公开仓库会泄露你的 refreshToken。
 
 ### 5. 手动测试
 
@@ -204,6 +229,7 @@ QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.l
 | 文件 | 说明 |
 |------|------|
 | `lynk_qx.js` | QX 定时脚本（当前使用） |
+| `lynk_token.js` | QX 重写脚本，自动拦截登录/刷新响应并保存 Token（免手动抓包） |
 | `ql_lynk.py` | 原版 Python 脚本（青龙面板版，含 License 系统，供参考） |
 
 ---
@@ -213,3 +239,4 @@ QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.l
 - 所有 Token 只存储在 QX 本地，不会上传到任何服务器
 - 仅供个人学习研究使用，请遵守领克 APP 用户协议
 - 抓包获取的 Token 请妥善保管，不要外泄
+- 使用 GitHub 远程地址时，脚本每次运行从你的仓库拉最新版；Token 仍只存 QX 本地（走偏好设置），不会进仓库。仓库若设为 public，请勿在脚本 CONFIG 区写入任何 Token
