@@ -357,15 +357,18 @@ async function getAccessToken() {
 
 // ===================== 业务 API =====================
 
-function apiGet(path, token, params) {
+// extraHeaders 在签名之后合并（这些头不参与签名，与官方一致，如风险控制头 risk_request_info）
+function apiGet(path, token, params, extraHeaders) {
   var bs = buildUrlAndSign("GET", path, params);
   var headers = Object.assign({}, bs.sig, { "token": token, "content-type": "application/json" });
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   return httpGet(bs.url, headers);
 }
 
-function apiPost(path, token, body, params) {
+function apiPost(path, token, body, params, extraHeaders) {
   var bs = buildUrlAndSign("POST", path, params);
   var headers = Object.assign({}, bs.sig, { "token": token, "content-type": "application/json" });
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   return httpPost(bs.url, headers, body || {});
 }
 
@@ -383,43 +386,106 @@ function shareReport(token, contentId, shareCode) {
   return apiPost("/app/v1/task/shareContentContectReporting", token, { contentId: contentId, shareCode: shareCode });
 }
 
-// —— 单步自助分享（实验性）——
-// 用主账号自身的 token 直接调 shareReporting，让服务器认为"已分享且有人点击"。
-// 实测有效组合（优先）：POST /app/v1/task/shareReporting?shareCode=xxx&contentId=xxx
-// 同时保留其他组合作为 fallback，并把每次尝试结果打印到日志便于排查。
-async function shareReportingSingle(token, shareCode, contentId) {
-  var attempts = [
-    { name: "POST_query", method: "POST", path: "/app/v1/task/shareReporting", params: { shareCode: shareCode, contentId: contentId } },
-    { name: "POST_body",  method: "POST", path: "/app/v1/task/shareReporting", params: {}, body: { shareCode: shareCode, contentId: contentId } },
-    { name: "GET_query",  method: "GET",  path: "/app/v1/task/shareReporting", params: { shareCode: shareCode, contentId: contentId } },
-    { name: "GET_only",   method: "GET",  path: "/app/v1/task/shareReporting", params: { shareCode: shareCode } },
-  ];
+// —— 自助分享任务（迁移自 xbgo/lynkco-daily 的实测有效逻辑，单账号即可加分）——
+// 核心：真正加分的是 POST /app/v1/task/reporting?type=99，带 businessNo(文章ID) + eventData。
+// 完整链路：取最新社区文章 → reporting?type=99 → getShareCode(带风险头) → shareReporting。
 
-  var lastResp = { code: "fail", message: "所有单步分享尝试均失败" };
-  for (var i = 0; i < attempts.length; i++) {
-    var a = attempts[i];
-    var resp;
-    try {
-      if (a.method === "POST") {
-        resp = await apiPost(a.path, token, a.body || {}, a.params);
-      } else {
-        resp = await apiGet(a.path, token, a.params);
-      }
-    } catch (e) {
-      resp = { code: "ERR", message: String(e) };
+// 构造文章分享 H5 链接（与官方 build_article_share_url 一致）
+function buildArticleShareUrl(articleId) {
+  var route = "lynkco://wx/?routeUrl=/pages/exploration/article/index.js?id=" + articleId;
+  return "https://h5.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
+    articleId + "&isShare=" + encodeURIComponent(route);
+}
+
+// 从社区信息流响应里递归找出第一篇文章的 articleId（作为 businessNo）
+function findFirstArticleId(node) {
+  if (!node) return null;
+  if (Array.isArray(node)) {
+    for (var i = 0; i < node.length; i++) {
+      var r = findFirstArticleId(node[i]);
+      if (r) return r;
     }
-    lastResp = resp;
-    log("单步分享尝试 " + a.name + ": code=" + String(resp.code) + " msg=" + String(resp.message || ""));
-
-    var code = String(resp.code);
-    var msg = resp.message || "";
-    if (code === "200" || code === "success" ||
-        msg.indexOf("已分享") >= 0 || msg.indexOf("已领取") >= 0 ||
-        msg.indexOf("今日已") >= 0 || msg.indexOf("已结束") >= 0) {
-      return resp;
+    return null;
+  }
+  if (typeof node === "object") {
+    if (node.articleId) {
+      var ct = String(node.contentType || "");
+      var ctc = String(node.contentTypeCode || "");
+      if (ct === "文章" || ctc === "article" || !ctc) return String(node.articleId);
+    }
+    for (var k in node) {
+      if (Object.prototype.hasOwnProperty.call(node, k)) {
+        var rr = findFirstArticleId(node[k]);
+        if (rr) return rr;
+      }
     }
   }
-  return lastResp;
+  return null;
+}
+
+// 风险控制头（getShareCode 需要，官方 risk_request_info）
+function buildRiskHeaders(shareUrl, appVersion) {
+  var now = new Date();
+  var openTs = now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate()) + " " +
+               pad2(now.getHours()) + ":" + pad2(now.getMinutes()) + ":" + pad2(now.getSeconds());
+  var riskInfo = {
+    openTimeStamp: openTs,
+    shareContentType: 1,          // 1=文章
+    shareContentURL: shareUrl,
+  };
+  return {
+    "use_security": "true",
+    "risk_type": "1",
+    "appVersion": appVersion || "4.2.3",
+    "risk_request_info": JSON.stringify(riskInfo),
+  };
+}
+
+// 判定分享类响应是否算完成（成功 / 今日已完成 均视为 OK）
+function shareDone(resp) {
+  if (isOk(resp)) return true;
+  var m = resp && resp.message ? String(resp.message) : "";
+  return m.indexOf("已分享") >= 0 || m.indexOf("已完成") >= 0 || m.indexOf("已领取") >= 0 ||
+         m.indexOf("今日已") >= 0 || m.indexOf("已结束") >= 0;
+}
+
+// 执行一次自助分享任务，返回 { ok, msg, businessNo }
+async function doShareTask(token) {
+  // 1. 确定要分享的文章 businessNo：优先取最新社区文章，失败回退到配置 SHARE_CID
+  var businessNo = null;
+  try {
+    var sq = await apiPost("/app/explore/home-page/square/index2", token, {});
+    if (isOk(sq)) businessNo = findFirstArticleId(sq.data);
+  } catch (_) {}
+  if (!businessNo) businessNo = SHARE_CID;
+  if (!businessNo) { log("自助分享: 无可分享文章"); return { ok: false, msg: "无可分享文章" }; }
+  log("自助分享文章 businessNo=" + businessNo);
+
+  var shareUrl = buildArticleShareUrl(businessNo);
+  var eventData = { firstClassification: "文章", secondClassification: "" };
+
+  // 2. 主上报 reporting?type=99（真正加分的一步）
+  var rep = await apiPost("/app/v1/task/reporting", token, { businessNo: businessNo, eventData: eventData }, { type: "99" });
+  log("reporting?type=99: code=" + String(rep.code) + " msg=" + String(rep.message || ""));
+
+  // 3. 取 shareCode（带风险头）
+  var shareCode = null;
+  try {
+    var scResp = await apiGet("/app/v1/task/getShareCode", token, null, buildRiskHeaders(shareUrl, "4.2.3"));
+    if (isOk(scResp) && scResp.data) shareCode = String(scResp.data);
+  } catch (_) {}
+
+  // 4. shareReporting?shareCode（同样带 businessNo + eventData）
+  if (shareCode) {
+    var scRep = await apiPost("/app/v1/task/shareReporting", token,
+      { businessNo: businessNo, eventData: eventData }, { shareCode: shareCode });
+    log("shareReporting: code=" + String(scRep.code) + " msg=" + String(scRep.message || ""));
+  }
+
+  // 结果判定：以主上报 reporting?type=99 是否完成为准
+  var ok = shareDone(rep);
+  var msg = ok ? "成功" : (rep.message || String(rep.code));
+  return { ok: ok, msg: msg, businessNo: businessNo };
 }
 
 // ===================== 主流程 =====================
@@ -577,24 +643,14 @@ async function main() {
     log("跳过自动分享: 未获取到 shareCode");
   }
 
-  // 5b. 单步自助分享（无需小号）：仅当没配 B 账号、开关开启、且拿到 shareCode 时执行
+  // 5b. 自助分享任务（无需小号）：迁移自 xbgo/lynkco-daily 的实测有效链路。
+  //     仅当没配 B 账号、开关开启时执行；无需预置 shareCode（内部自动取文章+取码）。
   var selfShareResult = null;
-  if (tokenBList.length === 0 && selfShareEnabled() && shareCode) {
-    log("尝试单步自助分享 (无需小号)");
-    var ssr = await shareReportingSingle(token, shareCode, SHARE_CID);
-    var scode = String(ssr.code);
-    var smsg = ssr.message || "";
-    if (scode === "200" || scode === "success") {
-      selfShareResult = { ok: true, msg: "成功" };
-      log("单步自助分享成功");
-    } else if (smsg.indexOf("已分享") >= 0 || smsg.indexOf("已领取") >= 0 ||
-               smsg.indexOf("今日已") >= 0 || smsg.indexOf("已结束") >= 0) {
-      selfShareResult = { ok: true, msg: "今日已分享" };
-      log("单步自助分享: 今日已分享 (" + smsg + ")");
-    } else {
-      selfShareResult = { ok: false, msg: smsg || scode };
-      log("单步自助分享失败 (" + scode + " " + smsg + ")");
-    }
+  if (tokenBList.length === 0 && selfShareEnabled()) {
+    log("尝试自助分享任务 (无需小号)");
+    var ssr = await doShareTask(token);
+    selfShareResult = { ok: ssr.ok, msg: ssr.msg };
+    log("自助分享任务结果: " + (ssr.ok ? "OK" : "FAIL") + " " + ssr.msg);
   }
 
   // 6. 构造通知
