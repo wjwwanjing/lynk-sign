@@ -14,7 +14,7 @@
 | Token 缓存 + 自动轮换 | refreshToken 28 天自动续期，无需反复抓包 |
 | 账户信息查询 | 能量体 / 成长等级 / 任务进度 |
 | 分享链接生成 | 可复制到微信发，别人点击你 +5 能量体 |
-| 自动分享刷积分 | 配小号走三步真实接口；无小号走自助分享任务（`reporting?type=99` 主上报，迁移自 xbgo/lynkco-daily） |
+| 自动分享刷积分 | 配小号走三步真实接口；无小号走自助分享任务（`reporting?type=99` + `shareReporting` 无 token 模拟被点击） |
 | HMAC-SHA256 签名 | 纯 JS 实现，满足阿里云 API 网关要求 |
 | iOS 原生通知 | 结果直接推到通知栏，不依赖任何第三方推送渠道 |
 
@@ -178,23 +178,28 @@ lynk_token_b = bearerB账号1的refreshToken,bearerB账号2的refreshToken
 
 ### 方式 B：自助分享任务（不配小号，迁移自 xbgo/lynkco-daily）
 
-**没配 `lynk_token_b` 时**，脚本会用**主账号自身**完成整套分享任务上报——**无需任何小号**。这套链路迁移自 [xbgo/lynkco-daily](https://github.com/xbgo/lynkco-daily) 的实测有效实现，关键点：**真正加分的一步是 `reporting?type=99`（带真实社区文章 `businessNo` + `eventData`）**，而不是单独调 `shareReporting`。
+**没配 `lynk_token_b` 时**，脚本会用**主账号自身**完成整套分享任务上报——**无需任何小号**。这套链路迁移自 [xbgo/lynkco-daily](https://github.com/xbgo/lynkco-daily) 的实测有效实现。
+
+**关键原理**：分享加分分两部分——"我分享了内容" + "有人点击阅读了我的分享"。脚本通过以下方式同时完成这两步：
+- `reporting?type=99` **带 token** = 上报"我分享了这个内容"
+- `shareReporting?shareCode=...` **不带 token** = 模拟访客点击分享链接，服务器视为"他人阅读了你的分享"
 
 完整链路（`doShareTask`）：
 
 ```
 POST /app/explore/home-page/square/index2                      # 1. 拉社区信息流，取最新文章 articleId 作为 businessNo
-POST /app/v1/task/reporting?type=99  {businessNo, eventData}    # 2. ★真正加分的一步
-GET  /app/v1/task/getShareCode        (带风险控制头)             # 3. 取 shareCode
-POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 分享回执
+GET  /app/v1/task/getShareCode        (带风险控制头)             # 2. 取 shareCode
+POST /app/v1/task/reporting?type=99  {businessNo, eventData}    # 3. ★主上报（带 token = "我分享了"）
+POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 模拟被点击（不带 token = "有人阅读了"）
 ```
 
 - **businessNo** 来源：优先从社区信息流 `square/index2` 取第一篇真实文章 ID；取不到才回退到配置的 `lynk_share_cid`。用真实文章而非固定 ID，更贴近官方 APP 行为。
+- **shareReporting 不带 token**：这是模拟"被点击阅读"的关键。当你在浏览器打开分享 H5 链接时，页面 JS 也是不带 token 调 `shareReporting`，服务器据此判定为访客点击。签名不含 token，所以签名仍然有效。
 - **风险控制头**：`getShareCode` 会带上 `use_security` / `risk_type` / `appVersion` / `risk_request_info`（含 `openTimeStamp`、`shareContentType=1`、`shareContentURL`）——这些头**在签名之后合并、不参与签名**，与官方一致。
-- **成功判定**：以 `reporting?type=99` 是否返回成功（或"今日已完成"类提示）为准。
+- **成功判定**：以 `reporting?type=99` 是否返回成功为准；`shareReporting` 的成功状态在通知中以"成功+被点击"或"成功(点击未确认)"区分。
 - 开关：`lynk_self_share`，默认 `"1"`（开启）；设 `"0"` 关闭。
-- 通知里以 `---自助分享(单步)---` 展示最终结果（`OK 成功` / `FAIL <原因>`）。
-- 运行日志（QX 脚本日志）会打印 `reporting?type=99` 和 `shareReporting` 各自的 `code` 和 `msg`，方便定位。
+- 通知里以 `---自助分享(单步)---` 展示最终结果。
+- 运行日志（QX 脚本日志）会打印每步的 `code` 和 `msg`，方便定位。
 
 > ⚠️ **诚实提示**：是否真给主账号加分，取决于领克后端当前的任务规则。请**跑一次后看通知结果 + 到 APP 里核对能量体有没有真的增加**来确认。若显示 FAIL 或能量体没涨，请改用方式 A（配小号三步）或手动把分享链接发给真人点击。
 
@@ -218,7 +223,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
   连续签到7天: 4 / 7 (1能量体)
   本月度签到25天: 7 / 25 (1补签卡)
   ---分享---
-  https://h5.lynkco.com/...
+  https://app.lynkco.com/...
   ---自动分享 (1/1)---
   B1: OK 成功
 ```

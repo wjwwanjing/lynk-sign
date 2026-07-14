@@ -372,6 +372,14 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
+// 不带 token 的 POST（用于 shareReporting：模拟访客点击分享链接，服务器视为"被他人阅读"）
+// 签名不含 token，所以签名仍然有效
+function apiPostNoToken(path, body, params) {
+  var bs = buildUrlAndSign("POST", path, params);
+  var headers = Object.assign({}, bs.sig, { "content-type": "application/json" });
+  return httpPost(bs.url, headers, body || {});
+}
+
 // —— 自动分享三步（与已验证的 Python 青龙版逻辑一致）——
 // 1) lookup：反查分享人 userId
 function shareLookup(token, shareCode) {
@@ -387,13 +395,13 @@ function shareReport(token, contentId, shareCode) {
 }
 
 // —— 自助分享任务（迁移自 xbgo/lynkco-daily 的实测有效逻辑，单账号即可加分）——
-// 核心：真正加分的是 POST /app/v1/task/reporting?type=99，带 businessNo(文章ID) + eventData。
-// 完整链路：取最新社区文章 → reporting?type=99 → getShareCode(带风险头) → shareReporting。
+// 核心链路：取社区文章 → getShareCode(带风险头) → reporting?type=99(带token="我分享了") → shareReporting(不带token="被人点击了")
+// 关键：shareReporting 不带 token，服务器视为访客点击分享链接，给分享者加"被阅读"分。
 
 // 构造文章分享 H5 链接（与官方 build_article_share_url 一致）
 function buildArticleShareUrl(articleId) {
   var route = "lynkco://wx/?routeUrl=/pages/exploration/article/index.js?id=" + articleId;
-  return "https://h5.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
+  return "https://app.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
     articleId + "&isShare=" + encodeURIComponent(route);
 }
 
@@ -464,28 +472,34 @@ async function doShareTask(token) {
   var shareUrl = buildArticleShareUrl(businessNo);
   var eventData = { firstClassification: "文章", secondClassification: "" };
 
-  // 2. 主上报 reporting?type=99（真正加分的一步）
-  var rep = await apiPost("/app/v1/task/reporting", token, { businessNo: businessNo, eventData: eventData }, { type: "99" });
-  log("reporting?type=99: code=" + String(rep.code) + " msg=" + String(rep.message || ""));
-
-  // 3. 取 shareCode（带风险头）
+  // 2. 先取 shareCode（带风险头）—— 与 xbgo Python 版顺序一致
   var shareCode = null;
   try {
     var scResp = await apiGet("/app/v1/task/getShareCode", token, null, buildRiskHeaders(shareUrl, "4.2.3"));
     if (isOk(scResp) && scResp.data) shareCode = String(scResp.data);
-  } catch (_) {}
+    log("getShareCode: code=" + String(scResp.code) + " shareCode=" + (shareCode ? shareCode.substring(0, 16) + "..." : "null"));
+  } catch (e) { log("getShareCode 异常: " + e); }
 
-  // 4. shareReporting?shareCode（同样带 businessNo + eventData）
+  // 3. 主上报 reporting?type=99（真正加分的一步，带 token = "我分享了这个内容"）
+  var rep = await apiPost("/app/v1/task/reporting", token, { businessNo: businessNo, eventData: eventData }, { type: "99" });
+  log("reporting?type=99: code=" + String(rep.code) + " msg=" + String(rep.message || ""));
+
+  // 4. shareReporting?shareCode（不带 token = 模拟访客点击/阅读分享链接）
+  //    服务器看到无 token 请求，判定为"他人点击了你的分享"，给分享者加"被阅读"分
+  var clickOk = false;
   if (shareCode) {
-    var scRep = await apiPost("/app/v1/task/shareReporting", token,
+    var scRep = await apiPostNoToken("/app/v1/task/shareReporting",
       { businessNo: businessNo, eventData: eventData }, { shareCode: shareCode });
-    log("shareReporting: code=" + String(scRep.code) + " msg=" + String(scRep.message || ""));
+    log("shareReporting(无token): code=" + String(scRep.code) + " msg=" + String(scRep.message || ""));
+    clickOk = shareDone(scRep);
+  } else {
+    log("shareReporting 跳过: 无 shareCode");
   }
 
-  // 结果判定：以主上报 reporting?type=99 是否完成为准
+  // 结果判定：主上报 reporting?type=99 完成 + 被点击模拟完成
   var ok = shareDone(rep);
-  var msg = ok ? "成功" : (rep.message || String(rep.code));
-  return { ok: ok, msg: msg, businessNo: businessNo };
+  var msg = ok ? (clickOk ? "成功+被点击" : "成功(点击未确认)") : (rep.message || String(rep.code));
+  return { ok: ok, msg: msg, businessNo: businessNo, shareCode: shareCode ? "有" : "无", clickOk: clickOk };
 }
 
 // ===================== 主流程 =====================
@@ -670,7 +684,7 @@ async function main() {
   if (shareCode) {
     var isShareRaw = "lynkco://wx/?routeUrl=/pages/exploration/article/index.js?id=" + SHARE_CID;
     var isShareEnc = encodeURIComponent(isShareRaw);
-    var shareUrl = "https://h5.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
+    var shareUrl = "https://app.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
       SHARE_CID + "&isShare=" + isShareEnc + "&shareCode=" + shareCode;
     lines.push("---分享---");
     lines.push(shareUrl);
