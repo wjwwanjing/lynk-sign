@@ -15,7 +15,11 @@
  *   lynk_refresh_token        主账号 refreshToken（28 天有效，自动续期）
  *   lynk_device_id            设备 ID（抓包请求头 gl_dev_id）
  *   lynk_token_b             B 账号 refreshToken，逗号分隔多个（可选，用于三步自动分享）
+ *   lynk_device_id_b          B 账号设备 ID，逗号分隔并与 Token 一一对应（可选）
  *   lynk_share_cid           分享文章 ID（可选，默认热门 ID）
+ *   lynk_share_app_version   分享风控头中的 App 版本（默认 4.2.3）
+ *   lynk_share_delay         签到后等待再分享的秒数（默认 60，与参考实现一致）
+ *   lynk_verify_delay        点击上报后等待奖励入账的秒数（默认 3）
  *   lynk_self_share          单步自助分享开关（"1"开/"0"关，默认开）：
  *                            没配小号时，用主账号自身调 shareReporting 上报，
  *                            让系统认为"已分享且有人点击"。实验性——是否真加分需真机验证。
@@ -40,7 +44,11 @@ const CONFIG = {
   REFRESH_TOKEN: "",   // 主账号 refreshToken，形如 bearer<uuid>
   DEVICE_ID:     "",   // 设备 ID
   TOKEN_B:      "",   // B 账号 refreshToken，多个用逗号分隔；留空=不启用三步分享
+  DEVICE_ID_B:  "",   // B 账号设备 ID，多个用逗号分隔；留空时回退到主账号设备 ID
   SHARE_CID:    "2072260486405246976", // 分享文章 ID
+  SHARE_APP_VERSION: "4.2.3", // getShareCode 风控头中的 App 版本
+  SHARE_DELAY:  "60", // 签到完成后等待再分享；参考实现默认 60 秒
+  VERIFY_DELAY: "3",  // 点击回调后等待服务端记账
   SELF_SHARE:   "1",  // 单步自助分享开关："1"开/"0"关；没配小号时用主账号自身上报（实验性）
 };
 
@@ -48,7 +56,11 @@ const CONFIG = {
 const REFRESH_TOKEN = $prefs.valueForKey("lynk_refresh_token") || CONFIG.REFRESH_TOKEN || "";
 const DEVICE_ID     = $prefs.valueForKey("lynk_device_id")     || CONFIG.DEVICE_ID     || "";
 const TOKEN_B_RAW   = $prefs.valueForKey("lynk_token_b")       || CONFIG.TOKEN_B      || "";
+const DEVICE_ID_B_RAW = $prefs.valueForKey("lynk_device_id_b") || CONFIG.DEVICE_ID_B  || "";
 const SHARE_CID     = $prefs.valueForKey("lynk_share_cid")     || CONFIG.SHARE_CID   || "2072260486405246976";
+const SHARE_APP_VERSION = $prefs.valueForKey("lynk_share_app_version") || CONFIG.SHARE_APP_VERSION || "4.2.3";
+const SHARE_DELAY   = nonNegativeInt($prefs.valueForKey("lynk_share_delay") || CONFIG.SHARE_DELAY, 60);
+const VERIFY_DELAY  = nonNegativeInt($prefs.valueForKey("lynk_verify_delay") || CONFIG.VERIFY_DELAY, 3);
 const SELF_SHARE    = String($prefs.valueForKey("lynk_self_share") || CONFIG.SELF_SHARE || "1");
 
 // 单步自助分享是否开启
@@ -66,6 +78,7 @@ const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method";
 const APP_VERSION      = "4.2.0";   // APP 版本号（与 doRefresh 一致）
 const APP_VERSION_CODE = "40200106"; // APP build 号（与 doRefresh 一致）
+const SHARE_H5_BASE = "https://h5.lynkco.com";
 
 // ===================== 纯 JS 加密实现（无外部依赖，已与 Node crypto 逐字节比对验证）=====================
 // 阿里云 API 网关要求 HMAC-SHA256 签名。QX 的 JS 环境不保证有 $crypto，
@@ -195,6 +208,23 @@ function log(msg) { console.log("[Lynk] " + msg); }
 
 // 补零（避免依赖 String.padStart，兼容更老的 QX 内核）
 function pad2(n) { n = String(n); return n.length < 2 ? "0" + n : n; }
+
+function nonNegativeInt(value, fallback) {
+  var n = parseInt(value, 10);
+  return isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function waitSeconds(seconds) {
+  var ms = nonNegativeInt(seconds, 0) * 1000;
+  return ms > 0 ? new Promise(function (resolve) { setTimeout(resolve, ms); }) : Promise.resolve();
+}
+
+function responseMessage(resp) {
+  if (!resp) return "无响应";
+  var code = resp.code != null ? String(resp.code) : "?";
+  var msg = resp.message || resp.msg || "";
+  return code + (msg ? " " + String(msg) : "");
+}
 
 function ts() { return String(Date.now()); }
 
@@ -341,9 +371,14 @@ async function getAccessToken() {
   var r = await doRefresh(REFRESH_TOKEN, DEVICE_ID);
   if (isOk(r)) {
     var dto = (r.data || {}).centerTokenDto || {};
-    saveATCache(dto.token);
-    log("accessToken: refresh 成功");
-    return { token: dto.token, source: "refresh", newRT: dto.refreshToken || null };
+    if (dto.token) {
+      saveATCache(dto.token);
+      log("accessToken: refresh 成功");
+      return { token: dto.token, source: "refresh", newRT: dto.refreshToken || null };
+    }
+    log("accessToken: refresh 响应缺少 token");
+  } else {
+    log("accessToken: refresh 失败 " + responseMessage(r));
   }
 
   // 降级：直接试探它本身是不是有效 accessToken（例如用户误填了 accessToken）
@@ -354,57 +389,63 @@ async function getAccessToken() {
     return { token: REFRESH_TOKEN, source: "bare", newRT: null };
   }
 
-  return { token: null, source: "failed", newRT: null };
+  return { token: null, source: "failed", newRT: null, error: responseMessage(r) };
 }
 
 // ===================== 业务 API =====================
 
-// extraHeaders 在签名之后合并（这些头不参与签名，与官方一致，如风险控制头 risk_request_info）
+// xbgo/lynkco-daily 的所有业务请求（包括无 token 的访客回调）都会带 APPCODE。
+// token 不参与网关签名；风险控制头也在签名后合并。
+function businessHeaders(token) {
+  var headers = {
+    "Authorization": "APPCODE " + APP_CODE,
+    "content-type": "application/json",
+  };
+  if (token) headers.token = token;
+  return headers;
+}
+
+// extraHeaders 在签名之后合并（这些头不参与签名，如 risk_request_info）
 function apiGet(path, token, params, extraHeaders) {
   var bs = buildUrlAndSign("GET", path, params);
-  var headers = Object.assign({}, bs.sig, { "token": token, "content-type": "application/json" });
+  var headers = Object.assign({}, bs.sig, businessHeaders(token));
   if (extraHeaders) Object.assign(headers, extraHeaders);
   return httpGet(bs.url, headers);
 }
 
 function apiPost(path, token, body, params, extraHeaders) {
   var bs = buildUrlAndSign("POST", path, params);
-  var headers = Object.assign({}, bs.sig, { "token": token, "content-type": "application/json" });
+  var headers = Object.assign({}, bs.sig, businessHeaders(token));
   if (extraHeaders) Object.assign(headers, extraHeaders);
   return httpPost(bs.url, headers, body || {});
 }
 
-// 不带 token 的 POST（用于 shareReporting：模拟访客点击分享链接，服务器视为"被他人阅读"）
-// 签名不含 token，所以签名仍然有效
-function apiPostNoToken(path, body, params) {
+// 不带 token，但仍带 APPCODE（与 H5 页面和 xbgo 参考实现一致）。
+function apiPostNoToken(path, body, params, extraHeaders) {
   var bs = buildUrlAndSign("POST", path, params);
-  var headers = Object.assign({}, bs.sig, { "content-type": "application/json" });
+  var headers = Object.assign({}, bs.sig, businessHeaders(null));
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   return httpPost(bs.url, headers, body || {});
 }
 
-// —— 自动分享三步（与已验证的 Python 青龙版逻辑一致）——
-// 1) lookup：反查分享人 userId
+// —— B 账号点击三步（来自 spritekite 参考仓库）——
 function shareLookup(token, shareCode) {
   return apiPost("/app/v1/task/shareCodeToUserId", token, { shareCode: shareCode });
 }
-// 2) check：后端前置校验（contentId + shareCode）
 function shareCheck(token, contentId, shareCode) {
   return apiPost("/app/v1/task/shareContentContectCheck", token, { contentId: contentId, shareCode: shareCode });
 }
-// 3) report：真正加分（contentId + shareCode）
 function shareReport(token, contentId, shareCode) {
   return apiPost("/app/v1/task/shareContentContectReporting", token, { contentId: contentId, shareCode: shareCode });
 }
 
-// —— 自助分享任务（迁移自 xbgo/lynkco-daily 的实测有效逻辑，单账号即可加分）——
-// 核心链路：取社区文章 → getShareCode(带风险头) → reporting?type=99(带token="我分享了") → shareReporting(不带token="被人点击了")
-// 关键：shareReporting 不带 token，服务器视为访客点击分享链接，给分享者加"被阅读"分。
-
-// 构造文章分享 H5 链接（与官方 build_article_share_url 一致）
-function buildArticleShareUrl(articleId) {
+// 构造文章分享 H5 链接。两个参考仓库均使用 h5.lynkco.com。
+function buildArticleShareUrl(articleId, shareCode) {
   var route = "lynkco://wx/?routeUrl=/pages/exploration/article/index.js?id=" + articleId;
-  return "https://app.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
-    articleId + "&isShare=" + encodeURIComponent(route);
+  var url = SHARE_H5_BASE + "/app-h5/dist/web/pages/exploration/article/index.html?id=" +
+    encodeURIComponent(articleId) + "&isShare=" + encodeURIComponent(route);
+  if (shareCode) url += "&shareCode=" + encodeURIComponent(shareCode);
+  return url;
 }
 
 // 从社区信息流响应里递归找出第一篇文章的 articleId（作为 businessNo）
@@ -446,104 +487,185 @@ function buildRiskHeaders(shareUrl, appVersion) {
   return {
     "use_security": "true",
     "risk_type": "1",
-    "appVersion": appVersion || "4.2.3",
+    "appVersion": appVersion || SHARE_APP_VERSION,
     "risk_request_info": JSON.stringify(riskInfo),
   };
 }
 
-// APP 特征头（让业务 API 请求看起来像官方 APP 发的，绕过 getShareCode 的风控拦截）
-// 这些头在 doRefresh 里就有，业务 API 之前没带 → 风控返回 share.need.validate.check
-function buildAppHeaders() {
-  return {
-    "Authorization": "APPCODE " + APP_CODE,
-    "publicplatform": "iOS",
-    "user-agent": "CA_iOS_SDK_2.0",
-    "gl_dev_id": DEVICE_ID || "",
-    "appversioncode": APP_VERSION,
-    "appversionname": APP_VERSION_CODE,
-    "gl_app_version": APP_VERSION,
-    "gl_app_build": APP_VERSION_CODE,
-    "x-ca-version": "1",
-  };
+function extractShareCode(resp) {
+  if (!isOk(resp)) return null;
+  var value = resp.data;
+  if (value && typeof value === "object") value = value.shareCode || value.code;
+  if (value == null) return null;
+  value = String(value).trim();
+  return value && value !== "null" && value !== "undefined" ? value : null;
 }
 
-// 判定分享类响应是否算完成（成功 / 今日已完成 均视为 OK）
-function shareDone(resp) {
-  if (isOk(resp)) return true;
-  var m = resp && resp.message ? String(resp.message) : "";
+function alreadyDone(resp) {
+  var m = resp && (resp.message || resp.msg) ? String(resp.message || resp.msg) : "";
   return m.indexOf("已分享") >= 0 || m.indexOf("已完成") >= 0 || m.indexOf("已领取") >= 0 ||
          m.indexOf("今日已") >= 0 || m.indexOf("已结束") >= 0;
 }
 
-// 执行一次自助分享任务，返回 { ok, msg, businessNo }
-async function doShareTask(token) {
-  // 1. 确定要分享的文章 businessNo：优先取最新社区文章，失败回退到配置 SHARE_CID
+// 判定接口是否接受了上报；这不等价于奖励已经到账。
+function shareDone(resp) {
+  return isOk(resp) || alreadyDone(resp);
+}
+
+function energyPointFrom(resp) {
+  if (!isOk(resp)) return null;
+  var value = (resp.data || {}).point;
+  if (value == null || value === "") return null;
+  var n = Number(value);
+  return isFinite(n) ? n : null;
+}
+
+async function readEnergyPoint(token) {
+  var resp = await apiGet("/app/energy/myEnergy", token);
+  return { response: resp, point: energyPointFrom(resp) };
+}
+
+async function verifyReward(token, before) {
+  await waitSeconds(VERIFY_DELAY);
+  var result = await readEnergyPoint(token);
+  var delta = before != null && result.point != null ? result.point - before : null;
+  return { before: before, after: result.point, delta: delta, response: result.response };
+}
+
+// 统一获取“文章 ID + 与该文章 URL 对应的 shareCode”。之前主流程裸调 getShareCode，
+// B 账号模式会被 share.need.validate.check 风控拦截，且链接文章与自助上报文章可能不一致。
+async function getShareContext(token) {
   var businessNo = null;
   try {
     var sq = await apiPost("/app/explore/home-page/square/index2", token, {});
     if (isOk(sq)) businessNo = findFirstArticleId(sq.data);
-  } catch (_) {}
+    else log("社区文章获取失败: " + responseMessage(sq));
+  } catch (e) {
+    log("社区文章获取异常: " + e);
+  }
   if (!businessNo) businessNo = SHARE_CID;
-  if (!businessNo) { log("自助分享: 无可分享文章"); return { ok: false, msg: "无可分享文章" }; }
-  log("自助分享文章 businessNo=" + businessNo);
+  if (!businessNo) return { ok: false, msg: "无可分享文章", businessNo: null, shareCode: null, shareUrl: null };
 
   var shareUrl = buildArticleShareUrl(businessNo);
-  var eventData = { firstClassification: "文章", secondClassification: "" };
-
-  // 2. 取 shareCode：合并 APP 特征头 + 风险头（风控需要"看起来像 APP 发的请求"）
-  //    如果风控返回 share.need.validate.check，等几秒重试一次（风控有时是短窗口限流）
   var shareCode = null;
   var scResp = null;
-  var appHeaders = buildAppHeaders();
-  var riskHeaders = buildRiskHeaders(shareUrl, APP_VERSION);
-  var allHeaders = Object.assign({}, appHeaders, riskHeaders);  // 风险头覆盖同名字段
+  var riskHeaders = buildRiskHeaders(shareUrl, SHARE_APP_VERSION);
 
   for (var attempt = 1; attempt <= 2; attempt++) {
-    try {
-      scResp = await apiGet("/app/v1/task/getShareCode", token, null, allHeaders);
-      log("getShareCode 尝试" + attempt + ": code=" + String(scResp.code) + " shareCode=" + (scResp.data ? String(scResp.data).substring(0, 16) + "..." : "null"));
-      if (isOk(scResp) && scResp.data) {
-        shareCode = String(scResp.data);
-        break;
-      }
-      // 风控限流：等 3 秒重试
-      if (scResp && (String(scResp.code) === "share.need.validate.check" || String(scResp.message || "").indexOf("验证") >= 0)) {
-        if (attempt === 1) {
-          log("getShareCode 风控拦截，3秒后重试");
-          await new Promise(function (r) { setTimeout(r, 3000); });
-          continue;
-        }
-      }
-      break;  // 其他错误不重试
-    } catch (e) {
-      log("getShareCode 异常: " + e);
-      break;
+    scResp = await apiGet("/app/v1/task/getShareCode", token, null, riskHeaders);
+    shareCode = extractShareCode(scResp);
+    log("getShareCode 尝试" + attempt + ": " + responseMessage(scResp) +
+        (shareCode ? "，已取到 shareCode" : "，无 shareCode"));
+    if (shareCode) break;
+    var riskBlocked = scResp && (String(scResp.code) === "share.need.validate.check" ||
+                      String(scResp.message || scResp.msg || "").indexOf("验证") >= 0);
+    if (attempt === 1 && riskBlocked) {
+      await waitSeconds(3);
+      continue;
     }
+    break;
   }
 
-  // 3. 主上报 reporting?type=99（带 token = "我分享了这个内容"）
-  var rep = await apiPost("/app/v1/task/reporting", token, { businessNo: businessNo, eventData: eventData }, { type: "99" });
-  log("reporting?type=99: code=" + String(rep.code) + " msg=" + String(rep.message || ""));
+  return {
+    ok: !!shareCode,
+    msg: shareCode ? "已获取分享码" : "getShareCode: " + responseMessage(scResp),
+    businessNo: String(businessNo),
+    shareCode: shareCode,
+    shareUrl: buildArticleShareUrl(businessNo, shareCode),
+    response: scResp,
+  };
+}
 
-  // 4. shareReporting?shareCode（不带 token = 模拟访客点击/阅读分享链接）
-  //    服务器看到无 token 请求，判定为"他人点击了你的分享"，给分享者加"被阅读"分
-  var clickOk = false;
-  if (shareCode) {
-    var scRep = await apiPostNoToken("/app/v1/task/shareReporting",
-      { businessNo: businessNo, eventData: eventData }, { shareCode: shareCode });
-    log("shareReporting(无token): code=" + String(scRep.code) + " msg=" + String(scRep.message || ""));
-    clickOk = shareDone(scRep);
+function sharePayload(businessNo) {
+  return {
+    businessNo: String(businessNo),
+    eventData: { firstClassification: "文章", secondClassification: "" },
+  };
+}
+
+// xbgo 链路：带 token 上报“我分享了”，再由无 token（但有 APPCODE）的 H5 回调上报浏览。
+async function doSelfShareTask(token, context, energyBefore) {
+  var payload = sharePayload(context.businessNo);
+  var rep = await apiPost("/app/v1/task/reporting", token, payload, { type: "99" });
+  log("reporting?type=99: " + responseMessage(rep));
+
+  var clickResp = null;
+  if (context.shareCode) {
+    clickResp = await apiPostNoToken("/app/v1/task/shareReporting", payload, { shareCode: context.shareCode });
+    log("shareReporting(无token): " + responseMessage(clickResp));
   } else {
-    log("shareReporting 跳过: 无 shareCode（getShareCode 被风控拦截）");
+    log("shareReporting 跳过: 无 shareCode");
   }
 
-  // 结果判定
-  var ok = shareDone(rep);
+  var verify = await verifyReward(token, energyBefore);
+  var rewarded = verify.delta != null && verify.delta > 0;
+  var reported = shareDone(rep);
+  var clicked = shareDone(clickResp);
+  var completed = alreadyDone(rep) || alreadyDone(clickResp);
+  var msg = "";
+  if (rewarded) msg = "奖励已到账 +" + verify.delta;
+  else if (completed) msg = "今日已完成，未产生新增奖励";
+  else if (reported && clicked) msg = "两步上报成功，但能量余额未变化";
+  else if (!reported) msg = "分享上报失败: " + responseMessage(rep);
+  else msg = "点击回调失败: " + responseMessage(clickResp);
+
+  return {
+    ok: rewarded || completed,
+    rewarded: rewarded,
+    reported: reported,
+    clicked: clicked,
+    completed: completed,
+    msg: msg,
+    verify: verify,
+    reportResponse: rep,
+    clickResponse: clickResp,
+  };
+}
+
+async function getSecondaryAccessToken(rt, deviceId) {
+  var refreshed = await doRefresh(rt, deviceId || DEVICE_ID);
+  if (isOk(refreshed)) {
+    var dto = (refreshed.data || {}).centerTokenDto || {};
+    if (dto.token) return { token: dto.token, newRT: dto.refreshToken || null, source: "refresh" };
+  }
+
+  // 兼容用户填入短效 accessToken 的情况。
+  var probe = await apiGet("/up/api/v1/userReward/getContinueDaysAndSignCard", rt);
+  if (isOk(probe)) return { token: rt, newRT: null, source: "bare" };
+  return { token: null, newRT: null, source: "failed", error: responseMessage(refreshed) };
+}
+
+async function doSecondaryShareTask(clickToken, mainToken, context, energyBefore) {
+  var lookup = await shareLookup(clickToken, context.shareCode);
+  var check = await shareCheck(clickToken, context.businessNo, context.shareCode);
+  var report = await shareReport(clickToken, context.businessNo, context.shareCode);
+  log("B账号 lookup: " + responseMessage(lookup));
+  log("B账号 check: " + responseMessage(check));
+  log("B账号 report: " + responseMessage(report));
+
+  var verify = await verifyReward(mainToken, energyBefore);
+  var rewarded = verify.delta != null && verify.delta > 0;
+  var completed = alreadyDone(report);
+  var accepted = shareDone(report);
   var msg;
-  if (ok && clickOk) msg = "成功+被点击";
-  else if (ok && !clickOk) msg = "成功(被点击未确认)";
-  else msg = (rep.message || String(rep.code));
-  return { ok: ok, msg: msg, businessNo: businessNo, shareCode: shareCode ? "有" : "无", clickOk: clickOk };
+  if (rewarded) msg = "主账号奖励已到账 +" + verify.delta;
+  else if (completed) msg = "今日已完成，未产生新增奖励";
+  else if (!shareDone(lookup)) msg = "lookup失败: " + responseMessage(lookup);
+  else if (!shareDone(check)) msg = "check失败: " + responseMessage(check);
+  else if (!accepted) msg = "report失败: " + responseMessage(report);
+  else msg = "三步上报成功，但主账号能量余额未变化";
+
+  return {
+    ok: rewarded || completed,
+    rewarded: rewarded,
+    completed: completed,
+    accepted: accepted,
+    msg: msg,
+    verify: verify,
+    lookup: lookup,
+    check: check,
+    report: report,
+  };
 }
 
 // ===================== 主流程 =====================
@@ -563,7 +685,7 @@ async function main() {
   // 1. 获取 accessToken
   var atResult = await getAccessToken();
   if (!atResult.token) {
-    $notify("领克签到", "Token 获取失败", "refresh_token 可能已过期，请重新抓包");
+    $notify("领克签到", "Token 获取失败", atResult.error || "refresh_token 可能已过期，请重新抓包");
     return;
   }
   var token = atResult.token;
@@ -582,8 +704,10 @@ async function main() {
     return;
   }
   var data = signInfo.data || {};
-  var isSigned = data.signStatus === 1 || data.signStatus === true ||
-                 data.signStatus === "1" || data.signStatus === "signed";
+  var signStatus = data.signStatus != null ? data.signStatus :
+                   (data.todaySigned != null ? data.todaySigned : data.status);
+  var isSigned = signStatus === 1 || signStatus === true || signStatus === "1" ||
+                 signStatus === "signed" || signStatus === "already";
   var streak = data.continuousSignDays || data.serialDays || data.continueDays || 0;
   var signCard = data.signCardNumber || 0;
 
@@ -608,15 +732,15 @@ async function main() {
     }
   }
 
-  // 4. 账户信息 + 任务 + 分享码（并行）
+  // 4. 账户信息 + 任务（并行）
   var energyP  = apiGet("/app/energy/myEnergy", token);
   var growthP  = apiGet("/app/energy/my/growth", token);
   var tasksP   = apiGet("/up/api/v1/userReward/getTaskList", token);
-  var shareP   = apiGet("/app/v1/task/getShareCode", token);
-  var results  = await Promise.all([energyP, growthP, tasksP, shareP]);
-  var energyResp = results[0], growthResp = results[1], tasksResp = results[2], shareResp = results[3];
+  var results  = await Promise.all([energyP, growthP, tasksP]);
+  var energyResp = results[0], growthResp = results[1], tasksResp = results[2];
 
   var energyPoint = "-", energyTotal = "-";
+  var energyBeforeShare = energyPointFrom(energyResp);
   if (isOk(energyResp)) {
     var ed = energyResp.data || {};
     energyPoint = ed.point != null ? String(ed.point) : "-";
@@ -637,78 +761,86 @@ async function main() {
       var proc = t.taskProcess != null ? String(t.taskProcess) : "?";
       var rw = (t.rewardContent || []).join(", ") || "无";
       var m = name.match(/(\d+)天/);
-      var disp = m ? String(Number(m[1]) - Number(proc)) + " / " + m[1] : proc;
+      var disp = m ? "已签 " + proc + " / " + m[1] : proc;
       taskLines.push(name + ": " + disp + " (" + rw + ")");
     });
   }
 
-  var shareCode = null;
-  if (shareResp.code === "success") {
-    var scData = shareResp.data;
-    if (typeof scData === "string" && /^[A-Fa-f0-9]{32,}$/.test(scData)) shareCode = scData;
-  }
-
-  // 5. 自动分享刷积分（B 账号走 lookup → check → report 三步）
+  // 5. 获取统一的分享上下文。自动分享时按参考实现先等待，给签到和任务状态留出同步时间。
   var shareResults = [];
+  var selfShareResult = null;
   var tokenBList = TOKEN_B_RAW.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+  var deviceBList = DEVICE_ID_B_RAW.split(",").map(function (s) { return s.trim(); });
+  var autoShareRequested = tokenBList.length > 0 || selfShareEnabled();
+  if (autoShareRequested && SHARE_DELAY > 0) {
+    log("签到后等待 " + SHARE_DELAY + " 秒再执行分享");
+    await waitSeconds(SHARE_DELAY);
+  }
+  var shareEnergyBaseline = { response: energyResp, point: energyBeforeShare };
+  if (autoShareRequested) {
+    // 等待结束后重取一次基线，避免把延迟到账的签到奖励误算成分享奖励。
+    shareEnergyBaseline = await readEnergyPoint(token);
+    if (shareEnergyBaseline.point != null) energyBeforeShare = shareEnergyBaseline.point;
+  }
+  var shareContext = await getShareContext(token);
+  var shareCode = shareContext.shareCode;
+  log("分享文章 businessNo=" + String(shareContext.businessNo || "-") + "，" + shareContext.msg);
 
-  if (tokenBList.length > 0 && shareCode) {
+  // 5a. B 账号走 lookup → check → report，并核验主账号奖励变化。
+  var energyCursor = energyBeforeShare;
+  var finalEnergyResp = shareEnergyBaseline.response || energyResp;
+  if (energyCursor == null) {
+    var energyProbe = await readEnergyPoint(token);
+    energyCursor = energyProbe.point;
+    finalEnergyResp = energyProbe.response;
+  }
+  if (tokenBList.length > 0 && shareContext.businessNo && shareCode) {
     log("开始自动分享: " + tokenBList.length + " 个 B 账号");
     for (var i = 0; i < tokenBList.length; i++) {
       var bRT = tokenBList[i];
       var label = "B" + (i + 1);
-
-      var bResp = await doRefresh(bRT, DEVICE_ID);
-      if (!isOk(bResp)) {
-        log(label + ": refresh 失败 (" + (bResp.message || bResp.code) + ")");
-        shareResults.push({ idx: i + 1, ok: false, msg: "refresh 失败" });
+      var bAuth = await getSecondaryAccessToken(bRT, deviceBList[i] || DEVICE_ID);
+      if (!bAuth.token) {
+        log(label + ": Token 获取失败 (" + (bAuth.error || bAuth.source) + ")");
+        shareResults.push({ idx: i + 1, ok: false, msg: "Token获取失败: " + (bAuth.error || bAuth.source) });
         continue;
       }
-      var bAT = ((bResp.data || {}).centerTokenDto || {}).token;
-      if (!bAT) {
-        log(label + ": 未获取到 accessToken");
-        shareResults.push({ idx: i + 1, ok: false, msg: "无 accessToken" });
-        continue;
-      }
-      // B 账号 refreshToken 轮换保存
-      var bNewRT = ((bResp.data || {}).centerTokenDto || {}).refreshToken;
-      if (bNewRT && bNewRT !== bRT) {
-        tokenBList[i] = bNewRT;
+      if (bAuth.newRT && bAuth.newRT !== bRT) {
+        tokenBList[i] = bAuth.newRT;
         $prefs.setValueForKey(tokenBList.join(","), "lynk_token_b");
         log(label + ": refreshToken 已自动更新");
       }
 
-      // 三步分享
-      await shareLookup(bAT, shareCode);
-      await shareCheck(bAT, SHARE_CID, shareCode);
-      var srResp = await shareReport(bAT, SHARE_CID, shareCode);
-      var code = String(srResp.code);
-      var msg = srResp.message || "";
-
-      if (code === "200" || code === "success") {
-        log(label + ": 分享上报成功");
-        shareResults.push({ idx: i + 1, ok: true, msg: "成功" });
-      } else if (msg.indexOf("已分享") >= 0 || msg.indexOf("已领取") >= 0 ||
-                 msg.indexOf("今日已") >= 0 || msg.indexOf("已结束") >= 0) {
-        log(label + ": 今日已分享 (" + msg + ")");
-        shareResults.push({ idx: i + 1, ok: true, msg: "今日已分享" });
-      } else {
-        log(label + ": 分享上报失败 (" + code + " " + msg + ")");
-        shareResults.push({ idx: i + 1, ok: false, msg: msg || code });
-      }
+      var bResult = await doSecondaryShareTask(bAuth.token, token, shareContext, energyCursor);
+      bResult.idx = i + 1;
+      shareResults.push(bResult);
+      if (bResult.verify.after != null) energyCursor = bResult.verify.after;
+      finalEnergyResp = bResult.verify.response;
+      log(label + ": " + (bResult.ok ? "OK " : "FAIL ") + bResult.msg);
     }
   } else if (tokenBList.length > 0 && !shareCode) {
-    log("跳过自动分享: 未获取到 shareCode");
+    shareResults.push({ idx: 1, ok: false, msg: "未获取到 shareCode: " + shareContext.msg });
+    log("跳过 B 账号自动分享: " + shareContext.msg);
   }
 
-  // 5b. 自助分享任务（无需小号）：迁移自 xbgo/lynkco-daily 的实测有效链路。
-  //     仅当没配 B 账号、开关开启时执行；无需预置 shareCode（内部自动取文章+取码）。
-  var selfShareResult = null;
-  if (tokenBList.length === 0 && selfShareEnabled()) {
+  // 5b. 无小号时执行 xbgo 的 reporting + shareReporting 链路。
+  if (tokenBList.length === 0 && selfShareEnabled() && shareContext.businessNo) {
     log("尝试自助分享任务 (无需小号)");
-    var ssr = await doShareTask(token);
-    selfShareResult = { ok: ssr.ok, msg: ssr.msg };
-    log("自助分享任务结果: " + (ssr.ok ? "OK" : "FAIL") + " " + ssr.msg);
+    selfShareResult = await doSelfShareTask(token, shareContext, energyCursor);
+    if (selfShareResult.verify.after != null) energyCursor = selfShareResult.verify.after;
+    finalEnergyResp = selfShareResult.verify.response;
+    log("自助分享任务结果: " + (selfShareResult.ok ? "OK " : "FAIL ") + selfShareResult.msg);
+  } else if (tokenBList.length === 0 && selfShareEnabled() && !shareContext.businessNo) {
+    selfShareResult = { ok: false, msg: shareContext.msg };
+  }
+
+  // 通知显示分享后的最终余额，避免仍显示分享前数值。
+  if (energyCursor != null) {
+    energyPoint = String(energyCursor);
+  }
+  if (isOk(finalEnergyResp)) {
+    var finalEnergyData = finalEnergyResp.data || {};
+    if (finalEnergyData.incomePoint != null) energyTotal = String(finalEnergyData.incomePoint);
   }
 
   // 6. 构造通知
@@ -725,13 +857,12 @@ async function main() {
     lines.push("---任务进度---");
     taskLines.forEach(function (l) { lines.push(l); });
   }
-  if (shareCode) {
-    var isShareRaw = "lynkco://wx/?routeUrl=/pages/exploration/article/index.js?id=" + SHARE_CID;
-    var isShareEnc = encodeURIComponent(isShareRaw);
-    var shareUrl = "https://app.lynkco.com/app-h5/dist/web/pages/exploration/article/index.html?id=" +
-      SHARE_CID + "&isShare=" + isShareEnc + "&shareCode=" + shareCode;
+  if (shareContext.shareUrl && shareCode) {
     lines.push("---分享---");
-    lines.push(shareUrl);
+    lines.push(shareContext.shareUrl);
+  } else if (!shareCode) {
+    lines.push("---分享码---");
+    lines.push("FAIL " + shareContext.msg);
   }
   if (shareResults.length > 0) {
     var okCount = shareResults.filter(function (r) { return r.ok; }).length;
@@ -741,7 +872,7 @@ async function main() {
     });
   }
   if (selfShareResult) {
-    lines.push("---自助分享(单步)---");
+    lines.push("---自助分享---");
     lines.push((selfShareResult.ok ? "OK" : "FAIL") + " " + selfShareResult.msg);
   }
 
