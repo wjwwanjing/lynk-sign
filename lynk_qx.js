@@ -17,8 +17,9 @@
  *   lynk_token_b             B 账号 refreshToken，逗号分隔多个（可选，用于三步自动分享）
  *   lynk_device_id_b          B 账号设备 ID，逗号分隔并与 Token 一一对应（可选）
  *   lynk_share_cid           分享文章 ID（可选，默认热门 ID）
+ *   lynk_share_code          从真实 APP 分享动作捕获的 shareCode（风控失败时回退）
  *   lynk_share_app_version   分享风控头中的 App 版本（默认 4.2.3）
- *   lynk_share_delay         签到后等待再分享的秒数（默认 60，与参考实现一致）
+ *   lynk_share_delay         签到后等待再分享的秒数（默认 10）
  *   lynk_verify_delay        点击上报后等待奖励入账的秒数（默认 3）
  *   lynk_self_share          单步自助分享开关（"1"开/"0"关，默认开）：
  *                            没配小号时，用主账号自身调 shareReporting 上报，
@@ -46,8 +47,9 @@ const CONFIG = {
   TOKEN_B:      "",   // B 账号 refreshToken，多个用逗号分隔；留空=不启用三步分享
   DEVICE_ID_B:  "",   // B 账号设备 ID，多个用逗号分隔；留空时回退到主账号设备 ID
   SHARE_CID:    "2072260486405246976", // 分享文章 ID
+  SHARE_CODE:   "",   // 可手工填入/由 lynk_share_capture.js 自动保存
   SHARE_APP_VERSION: "4.2.3", // getShareCode 风控头中的 App 版本
-  SHARE_DELAY:  "60", // 签到完成后等待再分享；参考实现默认 60 秒
+  SHARE_DELAY:  "10", // 签到完成后等待再分享
   VERIFY_DELAY: "3",  // 点击回调后等待服务端记账
   SELF_SHARE:   "1",  // 单步自助分享开关："1"开/"0"关；没配小号时用主账号自身上报（实验性）
 };
@@ -59,7 +61,7 @@ const TOKEN_B_RAW   = $prefs.valueForKey("lynk_token_b")       || CONFIG.TOKEN_B
 const DEVICE_ID_B_RAW = $prefs.valueForKey("lynk_device_id_b") || CONFIG.DEVICE_ID_B  || "";
 const SHARE_CID     = $prefs.valueForKey("lynk_share_cid")     || CONFIG.SHARE_CID   || "2072260486405246976";
 const SHARE_APP_VERSION = $prefs.valueForKey("lynk_share_app_version") || CONFIG.SHARE_APP_VERSION || "4.2.3";
-const SHARE_DELAY   = nonNegativeInt($prefs.valueForKey("lynk_share_delay") || CONFIG.SHARE_DELAY, 60);
+const SHARE_DELAY   = nonNegativeInt($prefs.valueForKey("lynk_share_delay") || CONFIG.SHARE_DELAY, 10);
 const VERIFY_DELAY  = nonNegativeInt($prefs.valueForKey("lynk_verify_delay") || CONFIG.VERIFY_DELAY, 3);
 const SELF_SHARE    = String($prefs.valueForKey("lynk_self_share") || CONFIG.SELF_SHARE || "1");
 
@@ -492,6 +494,46 @@ function buildRiskHeaders(shareUrl, appVersion) {
   };
 }
 
+function cachedShareCode() {
+  var value = $prefs.valueForKey("lynk_share_code") || CONFIG.SHARE_CODE || "";
+  value = String(value).trim();
+  return value && value !== "null" && value !== "undefined" ? value : null;
+}
+
+// 真实 APP 的 getShareCode 请求可能带设备风控指纹（例如 sweet_security_info）。
+// lynk_share_capture.js 只保存允许列表中的非 Token、非签名头，这里再次过滤后重放。
+function loadCapturedShareHeaders() {
+  var allowed = {
+    "sweet_security_info": true,
+    "publicplatform": true,
+    "user-agent": true,
+    "gl_dev_id": true,
+    "gl_app_version": true,
+    "gl_app_build": true,
+    "appversioncode": true,
+    "appversionname": true,
+    "x-ca-version": true,
+    "x-new-deviceid": true,
+    "x-push-deviceid": true,
+    "hardwaredeviceid": true,
+    "deviceid": true,
+    "geelydeviceid": true,
+    "origin": true,
+    "referer": true,
+  };
+  try {
+    var raw = $prefs.valueForKey("lynk_share_headers");
+    var parsed = raw ? JSON.parse(raw) : {};
+    var safe = {};
+    Object.keys(parsed || {}).forEach(function (key) {
+      if (allowed[String(key).toLowerCase()] && parsed[key] != null) safe[key] = String(parsed[key]);
+    });
+    return safe;
+  } catch (_) {
+    return {};
+  }
+}
+
 function extractShareCode(resp) {
   if (!isOk(resp)) return null;
   var value = resp.data;
@@ -549,30 +591,35 @@ async function getShareContext(token) {
   var shareUrl = buildArticleShareUrl(businessNo);
   var shareCode = null;
   var scResp = null;
+  var capturedHeaders = loadCapturedShareHeaders();
   var riskHeaders = buildRiskHeaders(shareUrl, SHARE_APP_VERSION);
+  var requestHeaders = Object.assign({}, capturedHeaders, riskHeaders);
+  var capturedHeaderCount = Object.keys(capturedHeaders).length;
+  if (capturedHeaderCount > 0) log("getShareCode: 重放 " + capturedHeaderCount + " 个真实 APP 风控头");
 
-  for (var attempt = 1; attempt <= 2; attempt++) {
-    scResp = await apiGet("/app/v1/task/getShareCode", token, null, riskHeaders);
-    shareCode = extractShareCode(scResp);
-    log("getShareCode 尝试" + attempt + ": " + responseMessage(scResp) +
-        (shareCode ? "，已取到 shareCode" : "，无 shareCode"));
-    if (shareCode) break;
-    var riskBlocked = scResp && (String(scResp.code) === "share.need.validate.check" ||
-                      String(scResp.message || scResp.msg || "").indexOf("验证") >= 0);
-    if (attempt === 1 && riskBlocked) {
-      await waitSeconds(3);
-      continue;
-    }
-    break;
+  scResp = await apiGet("/app/v1/task/getShareCode", token, null, requestHeaders);
+  shareCode = extractShareCode(scResp);
+  log("getShareCode: " + responseMessage(scResp) +
+      (shareCode ? "，已取到 shareCode" : "，无 shareCode"));
+
+  var usedCachedCode = false;
+  if (shareCode) {
+    $prefs.setValueForKey(shareCode, "lynk_share_code");
+  } else {
+    shareCode = cachedShareCode();
+    usedCachedCode = !!shareCode;
+    if (usedCachedCode) log("getShareCode 被风控拦截，回退使用已捕获的 shareCode");
   }
 
   return {
     ok: !!shareCode,
-    msg: shareCode ? "已获取分享码" : "getShareCode: " + responseMessage(scResp),
+    msg: usedCachedCode ? "实时取码被风控拦截，已使用捕获缓存" :
+         (shareCode ? "已获取分享码" : "getShareCode: " + responseMessage(scResp)),
     businessNo: String(businessNo),
     shareCode: shareCode,
     shareUrl: buildArticleShareUrl(businessNo, shareCode),
     response: scResp,
+    usedCachedCode: usedCachedCode,
   };
 }
 
