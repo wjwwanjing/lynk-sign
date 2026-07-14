@@ -195,7 +195,10 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 
 - **businessNo** 来源：优先从社区信息流 `square/index2` 取第一篇真实文章 ID；取不到才回退到配置的 `lynk_share_cid`。用真实文章而非固定 ID，更贴近官方 APP 行为。
 - **shareReporting 不带 token**：这是模拟"被点击阅读"的关键。当你在浏览器打开分享 H5 链接时，页面 JS 也是不带 token 调 `shareReporting`，服务器据此判定为访客点击。签名不含 token，所以签名仍然有效。
-- **风险控制头**：`getShareCode` 会带上 `use_security` / `risk_type` / `appVersion` / `risk_request_info`（含 `openTimeStamp`、`shareContentType=1`、`shareContentURL`）——这些头**在签名之后合并、不参与签名**，与官方一致。
+- **APP 特征头 + 风险控制头**：`getShareCode` 同时带两类头——
+  - **APP 特征头**（绕过风控）：`Authorization: APPCODE`、`publicplatform: iOS`、`user-agent: CA_iOS_SDK_2.0`、`gl_dev_id`、`appversioncode`、`appversionname`、`gl_app_version`、`gl_app_build`、`x-ca-version: 1`——与 `doRefresh` 一致，模拟"这是 APP 自己发的请求"，否则风控返回 `share.need.validate.check`
+  - **风险控制头**：`use_security: true` / `risk_type: 1` / `appVersion` / `risk_request_info`（含 `openTimeStamp`、`shareContentType=1`、`shareContentURL`）——这些头**在签名之后合并、不参与签名**，与官方一致
+- **重试机制**：若 `getShareCode` 返回风控拦截（`share.need.validate.check`），等 3 秒重试 1 次（风控有短窗口限流）
 - **成功判定**：以 `reporting?type=99` 是否返回成功为准；`shareReporting` 的成功状态在通知中以"成功+被点击"或"成功(点击未确认)"区分。
 - 开关：`lynk_self_share`，默认 `"1"`（开启）；设 `"0"` 关闭。
 - 通知里以 `---自助分享(单步)---` 展示最终结果。

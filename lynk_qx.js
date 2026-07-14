@@ -64,6 +64,8 @@ const CA_KEY     = "204644386";
 const CA_SECRET  = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method";
+const APP_VERSION      = "4.2.0";   // APP 版本号（与 doRefresh 一致）
+const APP_VERSION_CODE = "40200106"; // APP build 号（与 doRefresh 一致）
 
 // ===================== 纯 JS 加密实现（无外部依赖，已与 Node crypto 逐字节比对验证）=====================
 // 阿里云 API 网关要求 HMAC-SHA256 签名。QX 的 JS 环境不保证有 $crypto，
@@ -310,7 +312,7 @@ function doRefresh(rt, did) {
     refreshToken: rt,
     deviceId: did,
     deviceType: "IOS",
-    appVersion: "4.2.0",
+    appVersion: APP_VERSION,
   };
   var qs = Object.keys(params).map(function (k) {
     return k + "=" + encodeURIComponent(params[k]);
@@ -323,10 +325,10 @@ function doRefresh(rt, did) {
     "user-agent": "CA_iOS_SDK_2.0",
     "token": "",
     "gl_dev_id": did,
-    "appversioncode": "4.2.0",
-    "appversionname": "40200106",
-    "gl_app_version": "4.2.0",
-    "gl_app_build": "40200106",
+    "appversioncode": APP_VERSION,
+    "appversionname": APP_VERSION_CODE,
+    "gl_app_version": APP_VERSION,
+    "gl_app_build": APP_VERSION_CODE,
     "x-ca-version": "1",
   });
 }
@@ -449,6 +451,22 @@ function buildRiskHeaders(shareUrl, appVersion) {
   };
 }
 
+// APP 特征头（让业务 API 请求看起来像官方 APP 发的，绕过 getShareCode 的风控拦截）
+// 这些头在 doRefresh 里就有，业务 API 之前没带 → 风控返回 share.need.validate.check
+function buildAppHeaders() {
+  return {
+    "Authorization": "APPCODE " + APP_CODE,
+    "publicplatform": "iOS",
+    "user-agent": "CA_iOS_SDK_2.0",
+    "gl_dev_id": DEVICE_ID || "",
+    "appversioncode": APP_VERSION,
+    "appversionname": APP_VERSION_CODE,
+    "gl_app_version": APP_VERSION,
+    "gl_app_build": APP_VERSION_CODE,
+    "x-ca-version": "1",
+  };
+}
+
 // 判定分享类响应是否算完成（成功 / 今日已完成 均视为 OK）
 function shareDone(resp) {
   if (isOk(resp)) return true;
@@ -472,15 +490,38 @@ async function doShareTask(token) {
   var shareUrl = buildArticleShareUrl(businessNo);
   var eventData = { firstClassification: "文章", secondClassification: "" };
 
-  // 2. 先取 shareCode（带风险头）—— 与 xbgo Python 版顺序一致
+  // 2. 取 shareCode：合并 APP 特征头 + 风险头（风控需要"看起来像 APP 发的请求"）
+  //    如果风控返回 share.need.validate.check，等几秒重试一次（风控有时是短窗口限流）
   var shareCode = null;
-  try {
-    var scResp = await apiGet("/app/v1/task/getShareCode", token, null, buildRiskHeaders(shareUrl, "4.2.3"));
-    if (isOk(scResp) && scResp.data) shareCode = String(scResp.data);
-    log("getShareCode: code=" + String(scResp.code) + " shareCode=" + (shareCode ? shareCode.substring(0, 16) + "..." : "null"));
-  } catch (e) { log("getShareCode 异常: " + e); }
+  var scResp = null;
+  var appHeaders = buildAppHeaders();
+  var riskHeaders = buildRiskHeaders(shareUrl, APP_VERSION);
+  var allHeaders = Object.assign({}, appHeaders, riskHeaders);  // 风险头覆盖同名字段
 
-  // 3. 主上报 reporting?type=99（真正加分的一步，带 token = "我分享了这个内容"）
+  for (var attempt = 1; attempt <= 2; attempt++) {
+    try {
+      scResp = await apiGet("/app/v1/task/getShareCode", token, null, allHeaders);
+      log("getShareCode 尝试" + attempt + ": code=" + String(scResp.code) + " shareCode=" + (scResp.data ? String(scResp.data).substring(0, 16) + "..." : "null"));
+      if (isOk(scResp) && scResp.data) {
+        shareCode = String(scResp.data);
+        break;
+      }
+      // 风控限流：等 3 秒重试
+      if (scResp && (String(scResp.code) === "share.need.validate.check" || String(scResp.message || "").indexOf("验证") >= 0)) {
+        if (attempt === 1) {
+          log("getShareCode 风控拦截，3秒后重试");
+          await new Promise(function (r) { setTimeout(r, 3000); });
+          continue;
+        }
+      }
+      break;  // 其他错误不重试
+    } catch (e) {
+      log("getShareCode 异常: " + e);
+      break;
+    }
+  }
+
+  // 3. 主上报 reporting?type=99（带 token = "我分享了这个内容"）
   var rep = await apiPost("/app/v1/task/reporting", token, { businessNo: businessNo, eventData: eventData }, { type: "99" });
   log("reporting?type=99: code=" + String(rep.code) + " msg=" + String(rep.message || ""));
 
@@ -493,12 +534,15 @@ async function doShareTask(token) {
     log("shareReporting(无token): code=" + String(scRep.code) + " msg=" + String(scRep.message || ""));
     clickOk = shareDone(scRep);
   } else {
-    log("shareReporting 跳过: 无 shareCode");
+    log("shareReporting 跳过: 无 shareCode（getShareCode 被风控拦截）");
   }
 
-  // 结果判定：主上报 reporting?type=99 完成 + 被点击模拟完成
+  // 结果判定
   var ok = shareDone(rep);
-  var msg = ok ? (clickOk ? "成功+被点击" : "成功(点击未确认)") : (rep.message || String(rep.code));
+  var msg;
+  if (ok && clickOk) msg = "成功+被点击";
+  else if (ok && !clickOk) msg = "成功(被点击未确认)";
+  else msg = (rep.message || String(rep.code));
   return { ok: ok, msg: msg, businessNo: businessNo, shareCode: shareCode ? "有" : "无", clickOk: clickOk };
 }
 
