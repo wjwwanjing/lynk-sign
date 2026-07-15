@@ -495,6 +495,17 @@ function apiPostSign(token, body) {
   return httpPost(bs.url, headers, body || {});
 }
 
+// Consumer 鉴权降级：完全不发送 X-Ca-*，只使用 APPCODE + token。
+// 这与“X-Ca + APPCODE”不同，可避免网关优先选择无权限的 X-Ca Consumer。
+function apiPostSignAppCodeOnly(token, body) {
+  var path = SIGN_PATH.charAt(0) === "/" ? SIGN_PATH : "/up/api/v1/user/sign";
+  return httpPost(API_BASE + path, {
+    "Authorization": "APPCODE " + (SIGN_APP_CODE || APP_CODE),
+    "content-type": "application/json",
+    "token": token,
+  }, body || {});
+}
+
 // 不带 token，但仍带 APPCODE（与 H5 页面和 xbgo 参考实现一致）。
 function apiPostNoToken(path, body, params, extraHeaders) {
   var bs = buildUrlAndSign("POST", path, params);
@@ -887,6 +898,11 @@ async function main() {
   } else {
     log("签到: 使用专用 X-Ca 网关配置" + (SIGN_APP_CODE ? " (带 APPCODE)" : " (不带 APPCODE)"));
     var sr = await apiPostSign(token, {});
+    if (unauthorizedConsumer(sr)) {
+      log("签到: X-Ca Consumer 无权限，降级重试 APPCODE + token (不带 X-Ca)");
+      sr = await apiPostSignAppCodeOnly(token, {});
+      log("签到 APPCODE-only: " + responseMessage(sr));
+    }
     if (isOk(sr)) {
       signResult = "签到成功";
       rememberSignedToday();

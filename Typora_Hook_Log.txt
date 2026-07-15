@@ -1,0 +1,8 @@
+[2026/7/14 15:50:09] [Log] [&#128064;electron.net Request] POST https://store.typora.io/api/client/renew
+------------------
+[2026/7/14 15:50:09] [Log] request.url typeof: string value: https://store.typora.io/api/client/renew
+------------------
+[2026/7/14 16:34:22] [Log] [&#128737;&#65039; fsHook] 程序试图 fs.statSync C:\Users\wanghui\AppData\Roaming\Typora\backups
+------------------
+[2026/7/14 16:34:22] [Log] [&#128737;&#65039; fsHook] 程序试图 fs.statSync C:\Users\wanghui\AppData\Roaming\Typora/typora.log
+------------------
