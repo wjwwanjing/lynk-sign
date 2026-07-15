@@ -122,7 +122,6 @@ QX → 设置 → 其他设置 → 脚本 → 找到 lynk_qx.js → 配置：
 | `lynk_share_delay` | 签到后等待再分享的秒数，默认 `60`（与 `xbgo/lynkco-daily` 一致） |
 | `lynk_verify_delay` | 点击回调后等待服务端记账的秒数，默认 `3` |
 | `lynk_sign_path` | 签到端点覆盖，默认 `/up/api/v1/user/sign` |
-| `lynk_sign_app_code` | 签到服务网关 APPCode；一般留空使用内置值 |
 | `lynk_self_share` | 单步自助分享开关（`"1"`开/`"0"`关，默认开，无小号时用主账号自身上报，实验性） |
 
 ### 4. 添加到 QX 定时任务
@@ -257,7 +256,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 1. 先看日志（QX → 工具箱 → 脚本 → 日志）
 2. 最常见原因是 refreshToken 过期，重新抓包
 3. 如果提示"已签到"说明之前已经签过了，正常
-4. 如果旧 `app-api-gw-toc` 请求提示 `403 Unauthorized Consumer`，请更新脚本：APP 4.2.3 的执行签到请求可能与状态查询使用不同网关。更新重写模块后打开领克 APP 签到页面：未签到时捕获 POST 到 `lynk_sign_capture`，已经签到时只捕获 `/user/sign/day/info` 或 `getContinueDaysAndSignCard` 到 `lynk_sign_status_capture`；`userSignTip/getTipConfig` 等提示配置接口会被忽略，捕获内容不会保存 Token、签名或请求正文值。
+4. 如果执行签到提示 `403 Unauthorized Consumer`，先不要套用 Android 的 `app-services + CEP` 请求格式；该格式在当前 iOS/QX 实测为网络异常。更新重写模块后，在下一次尚未签到时先用领克 APP 手动签到，捕获真实 POST 到 `lynk_sign_capture`。已经签到时只能捕获 `/user/sign/day/info` 或 `getContinueDaysAndSignCard` 状态 GET；`userSignTip/getTipConfig` 等提示配置接口会被忽略。捕获内容不会保存 Token、签名或请求正文值。
 
 **脚本怎么调试？**
 QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.log 输出。
