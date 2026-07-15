@@ -1,4 +1,4 @@
-# 领克 APP 自动签到 - QX
+# APP 自动签到 - QX
 
 > iPhone QuantumultX 本地定时脚本，每天自动签到 + 查询账户信息 + 生成分享链接 + iOS 通知推送。
 
