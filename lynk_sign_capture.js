@@ -46,6 +46,9 @@
       xCaKey: lowerHeaders["x-ca-key"] || "",
       signatureHeaders: lowerHeaders["x-ca-signature-headers"] || "",
       hasAppCode: /^APPCODE\s+/i.test(auth),
+      hasCepAuthentication: /^AppId=/i.test(lowerHeaders.authentication || ""),
+      hasTenantId: !!lowerHeaders.tenantid,
+      useSecurity: String(lowerHeaders.use_security || "").toLowerCase() === "true",
       hasToken: !!lowerHeaders.token,
       contentType: lowerHeaders["content-type"] || "",
       appVersion: lowerHeaders.gl_app_version || lowerHeaders.appversioncode || "",
@@ -63,7 +66,8 @@
     $notify(
       isSignPost ? "领克签到请求已捕获" : "领克签到状态元数据已捕获",
       meta.method + " " + meta.path,
-      "X-Ca-Key=" + (meta.xCaKey || "无") + " | APPCODE=" + (meta.hasAppCode ? "有" : "无")
+      "X-Ca-Key=" + (meta.xCaKey || "无") + " | APPCODE=" + (meta.hasAppCode ? "有" : "无") +
+        " | CEP=" + (meta.hasCepAuthentication ? "有" : "无")
     );
   } catch (_) {
     // 诊断脚本不能影响领克 APP 原始响应。

@@ -22,9 +22,7 @@
  *   lynk_share_delay         签到后等待再分享的秒数（默认 10）
  *   lynk_verify_delay        点击上报后等待奖励入账的秒数（默认 3）
  *   lynk_sign_path           签到端点（默认 /up/api/v1/user/sign）
- *   lynk_sign_ca_key         签到专用 X-Ca-Key（可选；仅使用有权获得的配置）
- *   lynk_sign_ca_secret      签到专用 CA Secret（可选；不会写入日志）
- *   lynk_sign_app_code       签到专用 APPCode（可选；留空=签到不带 APPCODE）
+ *   lynk_sign_app_code       签到服务网关 APPCode（可选，默认使用内置值）
  *   lynk_self_share          单步自助分享开关（"1"开/"0"关，默认开）：
  *                            没配小号时，用主账号自身调 shareReporting 上报，
  *                            让系统认为"已分享且有人点击"。实验性——是否真加分需真机验证。
@@ -57,9 +55,7 @@ const CONFIG = {
   VERIFY_DELAY: "3",  // 点击回调后等待服务端记账
   SELF_SHARE:   "1",  // 单步自助分享开关："1"开/"0"关；没配小号时用主账号自身上报（实验性）
   SIGN_PATH:    "/up/api/v1/user/sign",
-  SIGN_CA_KEY:  "",   // 可选：新版签到专用网关 Key
-  SIGN_CA_SECRET: "", // 可选：与 SIGN_CA_KEY 配套；不要提交到公开仓库
-  SIGN_APP_CODE: "",  // 可选：新版签到若携带 APPCODE 时填写
+  SIGN_APP_CODE: "",  // 可选：留空时使用 APP_CODE
 };
 
 // 方法二：QX 偏好设置读取（有值则覆盖上面的 CONFIG）
@@ -90,9 +86,9 @@ const APP_VERSION      = "4.2.0";   // APP 版本号（与 doRefresh 一致）
 const APP_VERSION_CODE = "40200106"; // APP build 号（与 doRefresh 一致）
 const SHARE_H5_BASE = "https://h5.lynkco.com";
 const SIGN_PATH = String($prefs.valueForKey("lynk_sign_path") || CONFIG.SIGN_PATH || "/up/api/v1/user/sign");
-const SIGN_CA_KEY = String($prefs.valueForKey("lynk_sign_ca_key") || CONFIG.SIGN_CA_KEY || CA_KEY);
-const SIGN_CA_SECRET = String($prefs.valueForKey("lynk_sign_ca_secret") || CONFIG.SIGN_CA_SECRET || CA_SECRET);
-const SIGN_APP_CODE = String($prefs.valueForKey("lynk_sign_app_code") || CONFIG.SIGN_APP_CODE || "");
+const SIGN_APP_CODE = String($prefs.valueForKey("lynk_sign_app_code") || CONFIG.SIGN_APP_CODE || APP_CODE);
+const SIGN_TENANT_ID = "569001643002";
+const SIGN_CEP_APP_ID = "59701c08ed454a43a9b";
 
 // ===================== 纯 JS 加密实现（无外部依赖，已与 Node crypto 逐字节比对验证）=====================
 // 阿里云 API 网关要求 HMAC-SHA256 签名。QX 的 JS 环境不保证有 $crypto，
@@ -482,26 +478,19 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
-// 签到端点使用独立可覆盖凭据。公开旧 Key 已出现 Unauthorized Consumer，
-// 新值只能来自用户有权使用的私有配置；脚本不会尝试从请求中提取 CA Secret。
+// APP 4.2.3 的签到已走 app-services 服务网关，而不是旧 app-api-gw-toc X-Ca 网关。
+// 鉴权来自当前公开逆向实现：APPCODE + CEP AppId + tenantId + use_security + token。
 function apiPostSign(token, body) {
   var path = SIGN_PATH.charAt(0) === "/" ? SIGN_PATH : "/up/api/v1/user/sign";
-  var bs = buildUrlAndSign("POST", path, null, SIGN_CA_KEY, SIGN_CA_SECRET);
-  var headers = Object.assign({}, bs.sig, {
-    "content-type": "application/json",
-    "token": token,
-  });
-  if (SIGN_APP_CODE) headers.Authorization = "APPCODE " + SIGN_APP_CODE;
-  return httpPost(bs.url, headers, body || {});
-}
-
-// Consumer 鉴权降级：完全不发送 X-Ca-*，只使用 APPCODE + token。
-// 这与“X-Ca + APPCODE”不同，可避免网关优先选择无权限的 X-Ca Consumer。
-function apiPostSignAppCodeOnly(token, body) {
-  var path = SIGN_PATH.charAt(0) === "/" ? SIGN_PATH : "/up/api/v1/user/sign";
-  return httpPost(API_BASE + path, {
+  return httpPost(OAUTH_BASE + path, {
+    "User-Agent": "okhttp/4.9.3 LynkCo/" + (SHARE_APP_VERSION || "4.2.3") + " (iOS)",
+    "Accept": "application/json, text/plain, */*",
+    "content-type": "application/json; charset=utf-8",
+    "tenantId": SIGN_TENANT_ID,
+    "Authentication": "AppId=" + SIGN_CEP_APP_ID,
     "Authorization": "APPCODE " + SIGN_APP_CODE,
-    "content-type": "application/json",
+    "X-Ca-Nonce": nonce(),
+    "use_security": "true",
     "token": token,
   }, body || {});
 }
@@ -896,15 +885,8 @@ async function main() {
     if (!signedFromCache) rememberSignedToday();
     log("今日已签到" + (signedFromCache ? " (本地成功记录)" : ""));
   } else {
-    log("签到: 使用专用 X-Ca 网关配置" + (SIGN_APP_CODE ? " (带 APPCODE)" : " (不带 APPCODE)"));
+    log("签到: 使用 app-services 服务网关 (APPCODE + CEP + use_security)");
     var sr = await apiPostSign(token, {});
-    if (unauthorizedConsumer(sr) && SIGN_APP_CODE) {
-      log("签到: X-Ca Consumer 无权限，使用已配置的签到 APPCode 降级重试 (不带 X-Ca)");
-      sr = await apiPostSignAppCodeOnly(token, {});
-      log("签到 APPCODE-only: " + responseMessage(sr));
-    } else if (unauthorizedConsumer(sr)) {
-      log("签到: 默认 APPCode 已实测为 Invalid Key，未配置新 lynk_sign_app_code，不再盲目重试");
-    }
     if (isOk(sr)) {
       signResult = "签到成功";
       rememberSignedToday();
