@@ -225,7 +225,25 @@ function responseMessage(resp) {
   if (!resp) return "无响应";
   var code = resp.code != null ? String(resp.code) : "?";
   var msg = resp.message || resp.msg || "";
-  return code + (msg ? " " + String(msg) : "");
+  var http = resp._httpStatus != null ? String(resp._httpStatus) : "";
+  return code + (msg ? " " + String(msg) : "") + (http && code === "?" ? " (HTTP " + http + ")" : "");
+}
+
+// 只输出业务状态和字段名，避免把 token、shareCode 等响应内容写进日志。
+function safeResponseSummary(resp) {
+  if (!resp) return "无响应";
+  var parts = [];
+  parts.push("code=" + (resp.code != null ? String(resp.code) : "?"));
+  if (resp._httpStatus != null) parts.push("http=" + String(resp._httpStatus));
+  var msg = resp.message || resp.msg;
+  if (msg) parts.push("message=" + String(msg).slice(0, 100));
+  if (resp.data && typeof resp.data === "object") {
+    parts.push("dataKeys=" + Object.keys(resp.data).slice(0, 12).join(","));
+  } else if (resp.data != null) {
+    parts.push("dataType=" + typeof resp.data);
+  }
+  if (resp.raw != null) parts.push("rawLength=" + String(resp.raw).length);
+  return parts.join(" ");
 }
 
 function ts() { return String(Date.now()); }
@@ -299,8 +317,12 @@ function httpGet(url, headers) {
   return new Promise(function (resolve) {
     $task.fetch({ url: url, method: "GET", headers: headers || {} })
       .then(function (resp) {
-        try { resolve(JSON.parse(resp.body)); }
-        catch (_) { resolve({ code: resp.statusCode, raw: resp.body }); }
+        try {
+          var parsed = JSON.parse(resp.body);
+          if (parsed && typeof parsed === "object") parsed._httpStatus = resp.statusCode;
+          resolve(parsed);
+        }
+        catch (_) { resolve({ code: resp.statusCode, _httpStatus: resp.statusCode, raw: resp.body }); }
       }, function (err) {
         resolve({ code: "NET_ERR", message: String(err) });
       });
@@ -311,8 +333,12 @@ function httpPost(url, headers, body) {
   return new Promise(function (resolve) {
     $task.fetch({ url: url, method: "POST", headers: headers || {}, body: JSON.stringify(body || {}) })
       .then(function (resp) {
-        try { resolve(JSON.parse(resp.body)); }
-        catch (_) { resolve({ code: resp.statusCode, raw: resp.body }); }
+        try {
+          var parsed = JSON.parse(resp.body);
+          if (parsed && typeof parsed === "object") parsed._httpStatus = resp.statusCode;
+          resolve(parsed);
+        }
+        catch (_) { resolve({ code: resp.statusCode, _httpStatus: resp.statusCode, raw: resp.body }); }
       }, function (err) {
         resolve({ code: "NET_ERR", message: String(err) });
       });
@@ -549,6 +575,46 @@ function alreadyDone(resp) {
          m.indexOf("今日已") >= 0 || m.indexOf("已结束") >= 0;
 }
 
+// 不同 APP/网关版本使用过多种“今日已签”字段，集中兼容，避免重复散落判断。
+function signedStatus(data) {
+  data = data || {};
+  var candidates = [
+    data.signStatus,
+    data.todaySigned,
+    data.isSigned,
+    data.isSign,
+    data.isTodaySign,
+    data.todayIsSigned,
+    data.signToday,
+    data.signedToday,
+    data.hasSignedToday,
+    data.signInStatus,
+    data.signFlag,
+    data.signState,
+    data.whetherSign,
+    data.todaySignStatus,
+    data.status,
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    if (candidates[i] == null) continue;
+    var raw = candidates[i];
+    var value = String(raw).trim().toLowerCase();
+    if (raw === 1 || raw === true || value === "1" || value === "true" ||
+        value === "signed" || value === "already" || value === "done") return true;
+  }
+  return false;
+}
+
+function alreadySignedResponse(resp) {
+  if (!resp) return false;
+  var code = resp.code != null ? String(resp.code) : "";
+  var msg = resp.message || resp.msg || "";
+  var text = (code + " " + msg).toLowerCase();
+  return String(msg).indexOf("已签到") >= 0 || String(msg).indexOf("今日已签") >= 0 ||
+         String(msg).indexOf("重复签到") >= 0 ||
+         /already.*sign|sign.*already|repeat.*sign/.test(text);
+}
+
 // 判定接口是否接受了上报；这不等价于奖励已经到账。
 function shareDone(resp) {
   return isOk(resp) || alreadyDone(resp);
@@ -751,10 +817,7 @@ async function main() {
     return;
   }
   var data = signInfo.data || {};
-  var signStatus = data.signStatus != null ? data.signStatus :
-                   (data.todaySigned != null ? data.todaySigned : data.status);
-  var isSigned = signStatus === 1 || signStatus === true || signStatus === "1" ||
-                 signStatus === "signed" || signStatus === "already";
+  var isSigned = signedStatus(data);
   var streak = data.continuousSignDays || data.serialDays || data.continueDays || 0;
   var signCard = data.signCardNumber || 0;
 
@@ -773,9 +836,22 @@ async function main() {
       if (d.rewardSignCardNumber) parts.push("+" + d.rewardSignCardNumber + " 补签卡");
       reward = parts.length > 0 ? parts.join(", ") : "无奖励";
       log("签到成功: " + reward);
+    } else if (alreadySignedResponse(sr)) {
+      signResult = "已签到"; reward = "无新增";
+      log("今日已签到: " + responseMessage(sr));
     } else {
-      signResult = "签到失败"; reward = sr.message || "未知错误";
-      log("签到失败: " + reward);
+      // 某些版本会返回 HTTP 200 + 非标准业务体；用当天状态复查最终结果，
+      // 但绝不只因 HTTP 200 就宣告签到成功。
+      await waitSeconds(1);
+      var signRecheck = await apiGet("/up/api/v1/userReward/getContinueDaysAndSignCard", token);
+      if (isOk(signRecheck) && signedStatus(signRecheck.data || {})) {
+        signResult = "签到成功"; reward = "复查确认已签到";
+        log("签到接口返回非标准响应，但复查已签到: " + safeResponseSummary(sr));
+      } else {
+        signResult = "签到失败";
+        reward = sr.message || sr.msg || ("接口返回异常: " + safeResponseSummary(sr));
+        log("签到失败: " + reward + "；状态复查=" + safeResponseSummary(signRecheck));
+      }
     }
   }
 
