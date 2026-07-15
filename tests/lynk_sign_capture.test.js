@@ -50,6 +50,7 @@ assert.equal(meta.appVersion, "5.0.0");
 assert.deepEqual(Array.from(meta.deviceHeaderNames), ["gl_app_version", "gl_dev_id"]);
 assert.equal(doneCount, 1);
 assert.equal(notifications.length, 1);
+assert.match(notifications[0].body, /APP=5\.0\.0/);
 
 const serialized = saved.lynk_sign_capture;
 for (const secret of [
@@ -104,6 +105,7 @@ assert.equal(statusMeta.hasAppCode, true);
 assert.equal(statusDoneCount, 1);
 assert.equal(statusNotifications.length, 1);
 assert.match(statusNotifications[0].subtitle, /app-api-gw-toc\.lynkco\.com\/up\/api\/v1\/userReward/);
+assert.match(statusNotifications[0].body, /APP=5\.1\.0/);
 assert.equal(statusSaved.lynk_sign_status_capture.includes("status-secret-token"), false);
 assert.equal(statusSaved.lynk_sign_status_capture.includes("status-secret-app-code"), false);
 assert.equal(statusSaved.lynk_sign_status_capture.includes("status-signature-secret"), false);

@@ -312,6 +312,43 @@ async function testSignSupportsPathOverride() {
   assert.match(result.notifications[0].body, /签到成功/);
 }
 
+async function testSignRetriesWith424Consumer() {
+  let signPosts = 0;
+  const result = await runQx({
+    lynk_refresh_token: "main-refresh",
+    lynk_device_id: "main-device",
+    lynk_self_share: "0",
+    lynk_share_delay: "0",
+  }, async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/auth/login/refresh")) {
+      return { code: "success", data: { centerTokenDto: { token: "main-access" } } };
+    }
+    if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
+    if (url.pathname.endsWith("/user/sign")) {
+      signPosts += 1;
+      assert.equal(request.headers.Authorization, undefined);
+      assert.equal(request.headers.token, "main-access");
+      assert.ok(request.headers["X-Ca-Signature"]);
+      if (signPosts === 1) {
+        assert.equal(request.headers["X-Ca-Key"], "204644386");
+        return { code: "403", message: "Unauthorized Consumer" };
+      }
+      assert.equal(request.headers["X-Ca-Key"], "203760416");
+      return { code: "success", data: { rewardEnergyNumber: 1 } };
+    }
+    if (url.pathname === "/app/energy/myEnergy") return { code: "success", data: { point: 821, incomePoint: 1021 } };
+    if (url.pathname === "/app/energy/my/growth") return { code: "success", data: {} };
+    if (url.pathname.endsWith("getTaskList")) return { code: "success", data: [] };
+    if (url.pathname.endsWith("square/index2")) return { code: "success", data: [{ articleId: "article-fallback" }] };
+    if (url.pathname.endsWith("getShareCode")) return { code: "success", data: "code-fallback" };
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+
+  assert.equal(signPosts, 2, "Unauthorized Consumer must trigger exactly one 4.2.4 consumer retry");
+  assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
+}
+
 async function testLocalSignDateSkipsDuplicatePost() {
   const today = new Date();
   const dateKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
@@ -380,6 +417,7 @@ async function testDayInfoSkipsDuplicateSignPost() {
   await testAlreadySignedBusinessResponse();
   await testSignUsesIosGatewayAuthAndCachesDate();
   await testSignSupportsPathOverride();
+  await testSignRetriesWith424Consumer();
   await testLocalSignDateSkipsDuplicatePost();
   await testDayInfoSkipsDuplicateSignPost();
   console.log("lynk_qx tests passed");

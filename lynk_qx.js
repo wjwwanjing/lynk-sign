@@ -18,7 +18,7 @@
  *   lynk_device_id_b          B 账号设备 ID，逗号分隔并与 Token 一一对应（可选）
  *   lynk_share_cid           分享文章 ID（可选，默认热门 ID）
  *   lynk_share_code          从真实 APP 分享动作捕获的 shareCode（风控失败时回退）
- *   lynk_share_app_version   分享风控头中的 App 版本（默认 4.2.3）
+ *   lynk_share_app_version   分享风控头中的 App 版本（默认 4.2.4）
  *   lynk_share_delay         签到后等待再分享的秒数（默认 10）
  *   lynk_verify_delay        点击上报后等待奖励入账的秒数（默认 3）
  *   lynk_sign_path           签到端点（默认 /up/api/v1/user/sign）
@@ -49,7 +49,7 @@ const CONFIG = {
   DEVICE_ID_B:  "",   // B 账号设备 ID，多个用逗号分隔；留空时回退到主账号设备 ID
   SHARE_CID:    "2072260486405246976", // 分享文章 ID
   SHARE_CODE:   "",   // 可手工填入/由 lynk_share_capture.js 自动保存
-  SHARE_APP_VERSION: "4.2.3", // getShareCode 风控头中的 App 版本
+  SHARE_APP_VERSION: "4.2.4", // getShareCode 风控头中的 App 版本
   SHARE_DELAY:  "10", // 签到完成后等待再分享
   VERIFY_DELAY: "3",  // 点击回调后等待服务端记账
   SELF_SHARE:   "1",  // 单步自助分享开关："1"开/"0"关；没配小号时用主账号自身上报（实验性）
@@ -62,7 +62,7 @@ const DEVICE_ID     = $prefs.valueForKey("lynk_device_id")     || CONFIG.DEVICE_
 const TOKEN_B_RAW   = $prefs.valueForKey("lynk_token_b")       || CONFIG.TOKEN_B      || "";
 const DEVICE_ID_B_RAW = $prefs.valueForKey("lynk_device_id_b") || CONFIG.DEVICE_ID_B  || "";
 const SHARE_CID     = $prefs.valueForKey("lynk_share_cid")     || CONFIG.SHARE_CID   || "2072260486405246976";
-const SHARE_APP_VERSION = $prefs.valueForKey("lynk_share_app_version") || CONFIG.SHARE_APP_VERSION || "4.2.3";
+const SHARE_APP_VERSION = $prefs.valueForKey("lynk_share_app_version") || CONFIG.SHARE_APP_VERSION || "4.2.4";
 const SHARE_DELAY   = nonNegativeInt($prefs.valueForKey("lynk_share_delay") || CONFIG.SHARE_DELAY, 10);
 const VERIFY_DELAY  = nonNegativeInt($prefs.valueForKey("lynk_verify_delay") || CONFIG.VERIFY_DELAY, 3);
 const SELF_SHARE    = String($prefs.valueForKey("lynk_self_share") || CONFIG.SELF_SHARE || "1");
@@ -78,10 +78,14 @@ const API_BASE   = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_BASE = "https://app-services.lynkco.com.cn";
 const CA_KEY     = "204644386";
 const CA_SECRET  = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
+// 4.2.4 正版 IPA 的 CarWidget / CarShareExtension 运行时数据中同时存在的生产 consumer。
+// 它不是签到专用配置，因此只在默认 consumer 明确返回 Unauthorized Consumer 时用于一次重试。
+const SIGN_FALLBACK_CA_KEY = "203760416";
+const SIGN_FALLBACK_CA_SECRET = "IbyhE02AwkUzvupDon3xTZ3JIeddlppP";
 const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method";
-const APP_VERSION      = "4.2.0";   // APP 版本号（与 doRefresh 一致）
-const APP_VERSION_CODE = "40200106"; // APP build 号（与 doRefresh 一致）
+const APP_VERSION      = "4.2.4";   // APP 版本号（与 doRefresh 一致）
+const APP_VERSION_CODE = "40204067"; // APP build 号（来自 4.2.4 IPA）
 const SHARE_H5_BASE = "https://h5.lynkco.com";
 const SIGN_PATH = String($prefs.valueForKey("lynk_sign_path") || CONFIG.SIGN_PATH || "/up/api/v1/user/sign");
 
@@ -486,9 +490,9 @@ function apiPost(path, token, body, params, extraHeaders) {
 
 // iOS 当前已捕获的签到相关请求仍走 app-api-gw-toc + X-Ca，且不带 APPCODE/CEP。
 // 在捕获到真实 POST 之前严格保持修改前的请求格式，避免套用 Android 网关实现。
-function apiPostSign(token, body) {
+function apiPostSign(token, body, caKey, caSecret) {
   var path = SIGN_PATH.charAt(0) === "/" ? SIGN_PATH : "/up/api/v1/user/sign";
-  var bs = buildUrlAndSign("POST", path, null);
+  var bs = buildUrlAndSign("POST", path, null, caKey, caSecret);
   return httpPost(bs.url, Object.assign({}, bs.sig, {
     "content-type": "application/json",
     "token": token,
@@ -901,6 +905,13 @@ async function main() {
   } else {
     log("签到: 使用 iOS app-api X-Ca 原始请求格式");
     var sr = await apiPostSign(token, {});
+    var usedFallbackConsumer = false;
+    if (unauthorizedConsumer(sr)) {
+      usedFallbackConsumer = true;
+      log("签到: 默认 X-Ca Consumer 无端点权限，使用 4.2.4 内置备用 Consumer 重试");
+      sr = await apiPostSign(token, {}, SIGN_FALLBACK_CA_KEY, SIGN_FALLBACK_CA_SECRET);
+      log("签到备用 Consumer: " + safeResponseSummary(sr));
+    }
     if (isOk(sr)) {
       signResult = "签到成功";
       rememberSignedToday();
@@ -931,7 +942,9 @@ async function main() {
           (sr.message || sr.msg || ("接口返回异常: " + safeResponseSummary(sr)));
         log("签到失败: " + reward + "；状态复查=" + safeResponseSummary(signRecheck));
         if (unauthorizedConsumer(sr)) {
-          log("签到诊断: 当前公开 X-Ca-Key 无权调用该端点，请用 lynk_sign_capture.js 捕获最新版 APP 签到元数据");
+          log("签到诊断: 默认及 4.2.4 备用 Consumer 均无端点权限，请用 lynk_sign_capture.js 捕获真实签到 POST 元数据");
+        } else if (usedFallbackConsumer) {
+          log("签到诊断: 已尝试 4.2.4 内置备用 Consumer，服务端仍未确认签到");
         }
       }
     }
