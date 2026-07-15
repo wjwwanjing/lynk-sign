@@ -259,7 +259,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 1. 先看日志（QX → 工具箱 → 脚本 → 日志）
 2. 最常见原因是 refreshToken 过期，重新抓包
 3. 如果提示"已签到"说明之前已经签过了，正常
-4. 如果 X-Ca 请求提示 `403 Unauthorized Consumer`，脚本会自动再试一次 `APPCODE + token` 且完全不发送 X-Ca；只有两种模式都失败时，才说明公开凭据均无权调用。更新重写模块后，在领克 APP 下一次可签到时手动签到一次；`lynk_sign_capture.js` 会安全记录当前端点、`X-Ca-Key` 和 APPCODE 模式，不会保存 Token、签名或请求正文值。捕获信息保存在 QX 偏好键 `lynk_sign_capture`。
+4. 如果 X-Ca 请求提示 `403 Unauthorized Consumer`，说明公开旧 Key 对当前签到端点无权限；公开旧 APPCode 也已实测返回 `401 Invalid Key`，脚本不会再用它盲目重试。只有明确配置新的 `lynk_sign_app_code` 时才会尝试 APPCode-only。更新重写模块后，在领克 APP 下一次可签到时手动签到一次；`lynk_sign_capture.js` 会安全记录当前端点、`X-Ca-Key` 和 APPCODE 模式，不会保存 Token、签名或请求正文值。捕获信息保存在 QX 偏好键 `lynk_sign_capture`。
 
 **脚本怎么调试？**
 QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.log 输出。

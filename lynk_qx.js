@@ -500,7 +500,7 @@ function apiPostSign(token, body) {
 function apiPostSignAppCodeOnly(token, body) {
   var path = SIGN_PATH.charAt(0) === "/" ? SIGN_PATH : "/up/api/v1/user/sign";
   return httpPost(API_BASE + path, {
-    "Authorization": "APPCODE " + (SIGN_APP_CODE || APP_CODE),
+    "Authorization": "APPCODE " + SIGN_APP_CODE,
     "content-type": "application/json",
     "token": token,
   }, body || {});
@@ -898,10 +898,12 @@ async function main() {
   } else {
     log("签到: 使用专用 X-Ca 网关配置" + (SIGN_APP_CODE ? " (带 APPCODE)" : " (不带 APPCODE)"));
     var sr = await apiPostSign(token, {});
-    if (unauthorizedConsumer(sr)) {
-      log("签到: X-Ca Consumer 无权限，降级重试 APPCODE + token (不带 X-Ca)");
+    if (unauthorizedConsumer(sr) && SIGN_APP_CODE) {
+      log("签到: X-Ca Consumer 无权限，使用已配置的签到 APPCode 降级重试 (不带 X-Ca)");
       sr = await apiPostSignAppCodeOnly(token, {});
       log("签到 APPCODE-only: " + responseMessage(sr));
+    } else if (unauthorizedConsumer(sr)) {
+      log("签到: 默认 APPCode 已实测为 Invalid Key，未配置新 lynk_sign_app_code，不再盲目重试");
     }
     if (isOk(sr)) {
       signResult = "签到成功";
