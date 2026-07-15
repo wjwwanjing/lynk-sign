@@ -466,6 +466,17 @@ function apiGet(path, token, params, extraHeaders) {
   return httpGet(bs.url, headers);
 }
 
+// iOS 签到状态请求的捕获结果不带 APPCODE，保持 token + X-Ca 原始格式。
+function apiGetTokenOnly(path, token, params, extraHeaders) {
+  var bs = buildUrlAndSign("GET", path, params);
+  var headers = Object.assign({}, bs.sig, {
+    "content-type": "application/json",
+    "token": token,
+  });
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+  return httpGet(bs.url, headers);
+}
+
 function apiPost(path, token, body, params, extraHeaders) {
   var bs = buildUrlAndSign("POST", path, params);
   var headers = Object.assign({}, bs.sig, businessHeaders(token));
@@ -639,6 +650,17 @@ function signedStatus(data) {
         value === "signed" || value === "already" || value === "done") return true;
   }
   return false;
+}
+
+function signedStatusFromDayInfo(resp) {
+  if (!isOk(resp)) return false;
+  var data = resp.data;
+  if (data === true || data === 1 || data === "1" || String(data).toLowerCase() === "signed") return true;
+  if (!data || typeof data !== "object") return false;
+  if (signedStatus(data)) return true;
+  // 部分版本把当天状态再包一层；只检查语义明确的当前状态容器，避免把历史日期误判为今天。
+  var current = data.today || data.currentDay || data.dayInfo || data.signInfo || data.todayInfo;
+  return !!(current && typeof current === "object" && signedStatus(current));
 }
 
 function alreadySignedResponse(resp) {
@@ -861,9 +883,12 @@ async function main() {
     return;
   }
   var data = signInfo.data || {};
+  var dayInfo = await apiGetTokenOnly("/up/api/v1/user/sign/day/info", token);
+  log("签到日状态: " + safeResponseSummary(dayInfo));
   var signedDate = $prefs.valueForKey("lynk_last_sign_date") || "";
   var signedFromCache = signedDate === localDateKey();
-  var isSigned = signedStatus(data) || signedFromCache;
+  var signedFromDayInfo = signedStatusFromDayInfo(dayInfo);
+  var isSigned = signedStatus(data) || signedFromDayInfo || signedFromCache;
   var streak = data.continuousSignDays || data.serialDays || data.continueDays || 0;
   var signCard = data.signCardNumber || 0;
 
@@ -872,7 +897,7 @@ async function main() {
   if (isSigned) {
     signResult = "已签到"; reward = "无新增";
     if (!signedFromCache) rememberSignedToday();
-    log("今日已签到" + (signedFromCache ? " (本地成功记录)" : ""));
+    log("今日已签到" + (signedFromDayInfo ? " (day/info确认)" : (signedFromCache ? " (本地成功记录)" : "")));
   } else {
     log("签到: 使用 iOS app-api X-Ca 原始请求格式");
     var sr = await apiPostSign(token, {});
