@@ -18,8 +18,11 @@
     var pathMatch = url.match(/^https?:\/\/([^/]+)(\/[^?#]*)/i);
     var path = pathMatch ? pathMatch[2] : "";
 
-    // 重写规则会同时命中签到状态查询；只保存真正的 POST /sign 请求。
-    if (method !== "POST" || !/\/sign$/i.test(path)) {
+    var isSignPost = method === "POST" && /\/sign$/i.test(path);
+    var isSignStatus = method === "GET" && /sign/i.test(path);
+
+    // 已签到时 APP 不会再发 POST；此时保存状态查询的鉴权元数据用于当天调试。
+    if (!isSignPost && !isSignStatus) {
       $done({});
       return;
     }
@@ -36,6 +39,7 @@
 
     var meta = {
       capturedAt: new Date().toISOString(),
+      captureType: isSignPost ? "sign-post" : "sign-status",
       host: pathMatch ? pathMatch[1] : "",
       path: path,
       method: method,
@@ -54,9 +58,10 @@
         String(responseJson.message || responseJson.msg).slice(0, 100) : "",
     };
 
-    $prefs.setValueForKey(JSON.stringify(meta), "lynk_sign_capture");
+    var storageKey = isSignPost ? "lynk_sign_capture" : "lynk_sign_status_capture";
+    $prefs.setValueForKey(JSON.stringify(meta), storageKey);
     $notify(
-      "领克签到元数据已捕获",
+      isSignPost ? "领克签到请求已捕获" : "领克签到状态元数据已捕获",
       meta.method + " " + meta.path,
       "X-Ca-Key=" + (meta.xCaKey || "无") + " | APPCODE=" + (meta.hasAppCode ? "有" : "无")
     );
