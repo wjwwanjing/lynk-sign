@@ -242,8 +242,28 @@ function safeResponseSummary(resp) {
   } else if (resp.data != null) {
     parts.push("dataType=" + typeof resp.data);
   }
-  if (resp.raw != null) parts.push("rawLength=" + String(resp.raw).length);
+  if (resp.raw != null) {
+    var raw = String(resp.raw);
+    parts.push("rawLength=" + raw.length);
+    // 仅在错误响应很短时显示脱敏文本，便于区分 WAF 拒绝与“重复签到”。
+    if (raw.length <= 160) {
+      var preview = raw.replace(/[\r\n\t]+/g, " ")
+        .replace(/bearer\s*[a-z0-9._-]+/gi, "bearer[已脱敏]")
+        .replace(/[a-f0-9]{40,}/gi, "[长串已脱敏]")
+        .trim();
+      if (preview) parts.push("raw=" + preview);
+    }
+  }
   return parts.join(" ");
+}
+
+function localDateKey() {
+  var now = new Date();
+  return now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
+}
+
+function rememberSignedToday() {
+  $prefs.setValueForKey(localDateKey(), "lynk_last_sign_date");
 }
 
 function ts() { return String(Date.now()); }
@@ -560,6 +580,30 @@ function loadCapturedShareHeaders() {
   }
 }
 
+// 签到和取分享码属于同一 APP 网关。签到 POST 也可能校验设备指纹，
+// 因此复用已捕获的真实 APP 设备头，但排除只适用于 H5 页面的 origin/referer。
+function buildSignRequestHeaders() {
+  var defaults = {
+    "publicplatform": "iOS",
+    "user-agent": "CA_iOS_SDK_2.0",
+    "gl_dev_id": DEVICE_ID,
+    "gl_app_version": SHARE_APP_VERSION || APP_VERSION,
+    "gl_app_build": APP_VERSION_CODE,
+    "appversioncode": SHARE_APP_VERSION || APP_VERSION,
+    "appversionname": APP_VERSION_CODE,
+    "x-ca-version": "1",
+  };
+  var captured = loadCapturedShareHeaders();
+  Object.keys(captured).forEach(function (key) {
+    var lower = String(key).toLowerCase();
+    if (lower !== "origin" && lower !== "referer") defaults[key] = captured[key];
+  });
+  return { headers: defaults, capturedCount: Object.keys(captured).filter(function (key) {
+    var lower = String(key).toLowerCase();
+    return lower !== "origin" && lower !== "referer";
+  }).length };
+}
+
 function extractShareCode(resp) {
   if (!isOk(resp)) return null;
   var value = resp.data;
@@ -609,9 +653,11 @@ function alreadySignedResponse(resp) {
   if (!resp) return false;
   var code = resp.code != null ? String(resp.code) : "";
   var msg = resp.message || resp.msg || "";
-  var text = (code + " " + msg).toLowerCase();
+  var raw = resp.raw != null ? String(resp.raw) : "";
+  var text = (code + " " + msg + " " + raw).toLowerCase();
   return String(msg).indexOf("已签到") >= 0 || String(msg).indexOf("今日已签") >= 0 ||
-         String(msg).indexOf("重复签到") >= 0 ||
+         String(msg).indexOf("重复签到") >= 0 || raw.indexOf("已签到") >= 0 ||
+         raw.indexOf("今日已签") >= 0 || raw.indexOf("重复签到") >= 0 ||
          /already.*sign|sign.*already|repeat.*sign/.test(text);
 }
 
@@ -817,18 +863,27 @@ async function main() {
     return;
   }
   var data = signInfo.data || {};
-  var isSigned = signedStatus(data);
+  var signedDate = $prefs.valueForKey("lynk_last_sign_date") || "";
+  var signedFromCache = signedDate === localDateKey();
+  var isSigned = signedStatus(data) || signedFromCache;
   var streak = data.continuousSignDays || data.serialDays || data.continueDays || 0;
   var signCard = data.signCardNumber || 0;
 
   // 3. 执行签到
   var signResult, reward = "";
   if (isSigned) {
-    signResult = "已签到"; reward = "无新增"; log("今日已签到");
+    signResult = "已签到"; reward = "无新增";
+    if (!signedFromCache) rememberSignedToday();
+    log("今日已签到" + (signedFromCache ? " (本地成功记录)" : ""));
   } else {
-    var sr = await apiPost("/up/api/v1/user/sign", token, {});
+    var signRequest = buildSignRequestHeaders();
+    if (signRequest.capturedCount > 0) {
+      log("签到: 重放 " + signRequest.capturedCount + " 个真实 APP 设备头");
+    }
+    var sr = await apiPost("/up/api/v1/user/sign", token, {}, null, signRequest.headers);
     if (isOk(sr)) {
       signResult = "签到成功";
+      rememberSignedToday();
       var d = sr.data || {};
       var parts = [];
       if (d.rewardEnergyNumber) parts.push("+" + d.rewardEnergyNumber + " 能量体");
@@ -838,6 +893,7 @@ async function main() {
       log("签到成功: " + reward);
     } else if (alreadySignedResponse(sr)) {
       signResult = "已签到"; reward = "无新增";
+      rememberSignedToday();
       log("今日已签到: " + responseMessage(sr));
     } else {
       // 某些版本会返回 HTTP 200 + 非标准业务体；用当天状态复查最终结果，
@@ -846,6 +902,7 @@ async function main() {
       var signRecheck = await apiGet("/up/api/v1/userReward/getContinueDaysAndSignCard", token);
       if (isOk(signRecheck) && signedStatus(signRecheck.data || {})) {
         signResult = "签到成功"; reward = "复查确认已签到";
+        rememberSignedToday();
         log("签到接口返回非标准响应，但复查已签到: " + safeResponseSummary(sr));
       } else {
         signResult = "签到失败";
