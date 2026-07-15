@@ -442,7 +442,7 @@ async function getAccessToken() {
 
 // ===================== 业务 API =====================
 
-// xbgo/lynkco-daily 的所有业务请求（包括无 token 的访客回调）都会带 APPCODE。
+// 大部分业务请求（包括无 token 的访客回调）带 APPCODE。
 // token 不参与网关签名；风险控制头也在签名后合并。
 function businessHeaders(token) {
   var headers = {
@@ -464,6 +464,18 @@ function apiGet(path, token, params, extraHeaders) {
 function apiPost(path, token, body, params, extraHeaders) {
   var bs = buildUrlAndSign("POST", path, params);
   var headers = Object.assign({}, bs.sig, businessHeaders(token));
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+  return httpPost(bs.url, headers, body || {});
+}
+
+// 签到端点是例外：spritekite 参考实现只发送 token + X-Ca-* 网关签名。
+// 给 /up/api/v1/user/sign 加 APPCODE 会被网关以 403 Unauthorized Consumer 拒绝。
+function apiPostTokenOnly(path, token, body, params, extraHeaders) {
+  var bs = buildUrlAndSign("POST", path, params);
+  var headers = Object.assign({}, bs.sig, {
+    "content-type": "application/json",
+    "token": token,
+  });
   if (extraHeaders) Object.assign(headers, extraHeaders);
   return httpPost(bs.url, headers, body || {});
 }
@@ -578,30 +590,6 @@ function loadCapturedShareHeaders() {
   } catch (_) {
     return {};
   }
-}
-
-// 签到和取分享码属于同一 APP 网关。签到 POST 也可能校验设备指纹，
-// 因此复用已捕获的真实 APP 设备头，但排除只适用于 H5 页面的 origin/referer。
-function buildSignRequestHeaders() {
-  var defaults = {
-    "publicplatform": "iOS",
-    "user-agent": "CA_iOS_SDK_2.0",
-    "gl_dev_id": DEVICE_ID,
-    "gl_app_version": SHARE_APP_VERSION || APP_VERSION,
-    "gl_app_build": APP_VERSION_CODE,
-    "appversioncode": SHARE_APP_VERSION || APP_VERSION,
-    "appversionname": APP_VERSION_CODE,
-    "x-ca-version": "1",
-  };
-  var captured = loadCapturedShareHeaders();
-  Object.keys(captured).forEach(function (key) {
-    var lower = String(key).toLowerCase();
-    if (lower !== "origin" && lower !== "referer") defaults[key] = captured[key];
-  });
-  return { headers: defaults, capturedCount: Object.keys(captured).filter(function (key) {
-    var lower = String(key).toLowerCase();
-    return lower !== "origin" && lower !== "referer";
-  }).length };
 }
 
 function extractShareCode(resp) {
@@ -876,11 +864,8 @@ async function main() {
     if (!signedFromCache) rememberSignedToday();
     log("今日已签到" + (signedFromCache ? " (本地成功记录)" : ""));
   } else {
-    var signRequest = buildSignRequestHeaders();
-    if (signRequest.capturedCount > 0) {
-      log("签到: 重放 " + signRequest.capturedCount + " 个真实 APP 设备头");
-    }
-    var sr = await apiPost("/up/api/v1/user/sign", token, {}, null, signRequest.headers);
+    log("签到: 使用 token + X-Ca 网关签名 (不带 APPCODE)");
+    var sr = await apiPostTokenOnly("/up/api/v1/user/sign", token, {});
     if (isOk(sr)) {
       signResult = "签到成功";
       rememberSignedToday();
