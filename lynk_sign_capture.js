@@ -19,7 +19,10 @@
     var path = pathMatch ? pathMatch[2] : "";
 
     var isSignPost = method === "POST" && /\/sign$/i.test(path);
-    var isSignStatus = method === "GET" && /sign/i.test(path);
+    var isSignStatus = method === "GET" && (
+      /\/user\/sign\/day\/info$/i.test(path) ||
+      /\/userReward\/getContinueDaysAndSignCard$/i.test(path)
+    );
 
     // 已签到时 APP 不会再发 POST；此时保存状态查询的鉴权元数据用于当天调试。
     if (!isSignPost && !isSignStatus) {
@@ -65,7 +68,7 @@
     $prefs.setValueForKey(JSON.stringify(meta), storageKey);
     $notify(
       isSignPost ? "领克签到请求已捕获" : "领克签到状态元数据已捕获",
-      meta.method + " " + meta.path,
+      meta.method + " " + meta.host + meta.path,
       "X-Ca-Key=" + (meta.xCaKey || "无") + " | APPCODE=" + (meta.hasAppCode ? "有" : "无") +
         " | CEP=" + (meta.hasCepAuthentication ? "有" : "无")
     );

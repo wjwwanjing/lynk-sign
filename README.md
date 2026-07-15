@@ -257,7 +257,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 1. 先看日志（QX → 工具箱 → 脚本 → 日志）
 2. 最常见原因是 refreshToken 过期，重新抓包
 3. 如果提示"已签到"说明之前已经签过了，正常
-4. 如果旧 `app-api-gw-toc` 请求提示 `403 Unauthorized Consumer`，请更新脚本：APP 4.2.3 的执行签到请求已改走 `app-services.lynkco.com.cn`，使用 `APPCODE + tenantId + Authentication(AppId) + use_security + token`，不再使用旧 X-Ca Consumer。更新重写模块后打开领克 APP 签到页面：未签到时捕获 POST 到 `lynk_sign_capture`，已经签到时也会捕获状态 GET 到 `lynk_sign_status_capture`；捕获内容不会保存 Token、签名或请求正文值。
+4. 如果旧 `app-api-gw-toc` 请求提示 `403 Unauthorized Consumer`，请更新脚本：APP 4.2.3 的执行签到请求可能与状态查询使用不同网关。更新重写模块后打开领克 APP 签到页面：未签到时捕获 POST 到 `lynk_sign_capture`，已经签到时只捕获 `/user/sign/day/info` 或 `getContinueDaysAndSignCard` 到 `lynk_sign_status_capture`；`userSignTip/getTipConfig` 等提示配置接口会被忽略，捕获内容不会保存 Token、签名或请求正文值。
 
 **脚本怎么调试？**
 QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.log 输出。
