@@ -492,116 +492,20 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
-function knownCaSecret(caKey) {
-  if (String(caKey) === CA_KEY) return CA_SECRET;
-  if (String(caKey) === SIGN_FALLBACK_CA_KEY) return SIGN_FALLBACK_CA_SECRET;
-  return "";
+// 签到端点：与两个参考仓库（spritekite / xbgo）一致，固定 POST /up/api/v1/user/sign，
+// 只带 token + X-Ca 签名，不带 APPCODE。lynk_sign_path 可在新版网关迁移路径时覆盖。
+function signPath() {
+  return SIGN_PATH_PREF && SIGN_PATH_PREF.charAt(0) === "/" ? SIGN_PATH_PREF : DEFAULT_SIGN_PATH;
 }
 
-function sameSignatureHeaders(value) {
-  if (!value) return true;
-  var normalize = function (text) {
-    return String(text).split(",").map(function (item) { return item.trim().toLowerCase(); })
-      .filter(Boolean).sort().join(",");
-  };
-  return normalize(value) === normalize(SIG_HDRS);
-}
-
-// 读取 lynk_sign_capture.js 捕获的真实 APP 签到 POST 元数据。
-// 仅当 Key 的签名密钥在本地已知、且签名头格式可复现时才自动采用，避免盲目重放错误配置。
-function capturedSignProfile() {
-  var raw = $prefs.valueForKey("lynk_sign_capture") || "";
-  if (!raw) return null;
-  try {
-    var meta = JSON.parse(raw);
-    var host = String(meta.host || "").toLowerCase();
-    var path = String(meta.path || "");
-    var caKey = String(meta.xCaKey || "");
-    if (meta.captureType !== "sign-post" || String(meta.method).toUpperCase() !== "POST") return null;
-    if (host !== "app-api-gw-toc.lynkco.com" && host !== "app-services.lynkco.com.cn") return null;
-    if (path.charAt(0) !== "/") return null;
-    var caSecret = knownCaSecret(caKey);
-    return {
-      source: "真实 APP 捕获",
-      supported: !!caSecret && sameSignatureHeaders(meta.signatureHeaders) && !meta.hasCepAuthentication,
-      unsupportedReason: !caSecret ? "捕获到未知 X-Ca-Key=" + (caKey || "无") :
-        (!sameSignatureHeaders(meta.signatureHeaders) ? "捕获到不同的 X-Ca-Signature-Headers" :
-          (meta.hasCepAuthentication ? "捕获请求使用 CEP，当前脚本没有可安全重建的 CEP 值" : "")),
-      baseUrl: "https://" + host,
-      path: path,
-      caKey: caKey,
-      caSecret: caSecret,
-      hasAppCode: !!meta.hasAppCode,
-      useSecurity: !!meta.useSecurity,
-      hasRiskType: !!meta.hasRiskType,
-      contentType: String(meta.contentType || "application/json"),
-      accept: String(meta.accept || "*/*"),
-      publicPlatform: String(meta.publicPlatform || ""),
-      appVersion: String(meta.appVersion || ""),
-      appBuild: String(meta.appBuild || ""),
-      xCaVersion: String(meta.xCaVersion || ""),
-      deviceHeaderNames: meta.deviceHeaderNames || [],
-    };
-  } catch (_) {
-    return null;
-  }
-}
-
-function activeSignProfile() {
-  var captured = capturedSignProfile();
-  if (captured && captured.supported) {
-    if (SIGN_PATH_PREF) captured.path = SIGN_PATH_PREF.charAt(0) === "/" ? SIGN_PATH_PREF : DEFAULT_SIGN_PATH;
-    return captured;
-  }
-  return {
-    source: SIGN_PATH_PREF ? "手工路径覆盖" : "d6549ff 原始配置",
-    supported: true,
-    baseUrl: API_BASE,
-    path: SIGN_PATH_PREF && SIGN_PATH_PREF.charAt(0) === "/" ? SIGN_PATH_PREF : DEFAULT_SIGN_PATH,
-    caKey: CA_KEY,
-    caSecret: CA_SECRET,
-    hasAppCode: false,
-    useSecurity: false,
-    hasRiskType: false,
-    contentType: "application/json",
-    accept: "*/*",
-    publicPlatform: "",
-    appVersion: "",
-    appBuild: "",
-    xCaVersion: "",
-    deviceHeaderNames: [],
-    capturedUnsupported: captured && !captured.supported ? captured.unsupportedReason : "",
-  };
-}
-
-function profileHasHeader(profile, name) {
-  return (profile.deviceHeaderNames || []).some(function (item) {
-    return String(item).toLowerCase() === String(name).toLowerCase();
-  });
-}
-
-// 默认分支与 d6549ff 的签到请求逐项一致；捕获到可复现的真实 POST 后才替换 host/path/头格式。
-function apiPostSign(token, body, profile) {
-  profile = profile || activeSignProfile();
-  var bs = buildUrlAndSign("POST", profile.path, null, profile.caKey, profile.caSecret, {
-    accept: profile.accept,
-    contentType: profile.contentType,
-  });
+// caKey/caSecret 留空时由 hmacSign 回退到默认 Consumer；仅 403 Unauthorized Consumer 时才传入备用 Consumer。
+function apiPostSign(token, body, caKey, caSecret) {
+  var bs = buildUrlAndSign("POST", signPath(), null, caKey, caSecret);
   var headers = Object.assign({}, bs.sig, {
-    "content-type": profile.contentType,
+    "content-type": "application/json",
     "token": token,
   });
-  if (profile.hasAppCode) headers.Authorization = "APPCODE " + APP_CODE;
-  if (profile.useSecurity) headers.use_security = "true";
-  if (profile.hasRiskType) headers.risk_type = "1";
-  if (profile.publicPlatform) headers.publicplatform = profile.publicPlatform;
-  if (profile.xCaVersion) headers["x-ca-version"] = profile.xCaVersion;
-  if (profileHasHeader(profile, "gl_app_version") && profile.appVersion) headers.gl_app_version = profile.appVersion;
-  if (profileHasHeader(profile, "gl_app_build") && profile.appBuild) headers.gl_app_build = profile.appBuild;
-  if (profileHasHeader(profile, "appversioncode") && profile.appVersion) headers.appversioncode = profile.appVersion;
-  if (profileHasHeader(profile, "appversionname") && profile.appBuild) headers.appversionname = profile.appBuild;
-  if (profileHasHeader(profile, "gl_dev_id") && DEVICE_ID) headers.gl_dev_id = DEVICE_ID;
-  return httpPost(profile.baseUrl + profile.path, headers, body || {});
+  return httpPost(bs.url, headers, body || {});
 }
 
 // 不带 token，但仍带 APPCODE（与 H5 页面和 xbgo 参考实现一致）。
@@ -795,22 +699,24 @@ function shareDone(resp) {
   return isOk(resp) || alreadyDone(resp);
 }
 
-function energyPointFrom(resp) {
+// /app/energy/myEnergy.data.point 在 4.2.4 APP 中展示为 Co积分，
+// 分享任务奖励的“能量体”实际对应 /app/energy/my/growth.data.accountLevelVo.growth。
+function rewardEnergyFrom(resp) {
   if (!isOk(resp)) return null;
-  var value = (resp.data || {}).point;
+  var value = (((resp.data || {}).accountLevelVo) || {}).growth;
   if (value == null || value === "") return null;
   var n = Number(value);
   return isFinite(n) ? n : null;
 }
 
-async function readEnergyPoint(token) {
-  var resp = await apiGet("/app/energy/myEnergy", token);
-  return { response: resp, point: energyPointFrom(resp) };
+async function readRewardEnergy(token) {
+  var resp = await apiGet("/app/energy/my/growth", token);
+  return { response: resp, point: rewardEnergyFrom(resp) };
 }
 
 async function verifyReward(token, before) {
   await waitSeconds(VERIFY_DELAY);
-  var result = await readEnergyPoint(token);
+  var result = await readRewardEnergy(token);
   var delta = before != null && result.point != null ? result.point - before : null;
   return { before: before, after: result.point, delta: delta, response: result.response };
 }
@@ -1008,24 +914,13 @@ async function main() {
     if (!signedFromCache) rememberSignedToday();
     log("今日已签到" + (signedFromDayInfo ? " (day/info确认)" : (signedFromCache ? " (本地成功记录)" : "")));
   } else {
-    var signProfile = activeSignProfile();
-    log("签到: 使用" + signProfile.source + " host=" + signProfile.baseUrl.replace(/^https?:\/\//, "") +
-      " path=" + signProfile.path + " X-Ca-Key=" + signProfile.caKey +
-      (signProfile.hasAppCode ? " + APPCODE" : "，不带 APPCODE"));
-    if (signProfile.capturedUnsupported) {
-      log("签到捕获配置未自动采用: " + signProfile.capturedUnsupported);
-    }
-    var sr = await apiPostSign(token, {}, signProfile);
+    log("签到: POST " + signPath() + "，token + X-Ca 签名，不带 APPCODE");
+    var sr = await apiPostSign(token, {});
     var usedFallbackConsumer = false;
-    if (unauthorizedConsumer(sr) && signProfile.caKey === CA_KEY) {
+    if (unauthorizedConsumer(sr)) {
       usedFallbackConsumer = true;
-      var fallbackProfile = Object.assign({}, signProfile, {
-        source: "4.2.4 扩展内置备用 Consumer",
-        caKey: SIGN_FALLBACK_CA_KEY,
-        caSecret: SIGN_FALLBACK_CA_SECRET,
-      });
-      log("签到: 当前 Consumer 无端点权限，使用 4.2.4 内置备用 Consumer 做最后一次诊断重试");
-      sr = await apiPostSign(token, {}, fallbackProfile);
+      log("签到: 默认 Consumer 无端点权限，使用 4.2.4 内置备用 Consumer 重试一次");
+      sr = await apiPostSign(token, {}, SIGN_FALLBACK_CA_KEY, SIGN_FALLBACK_CA_SECRET);
       log("签到备用 Consumer: " + safeResponseSummary(sr));
     }
     if (isOk(sr)) {
@@ -1058,7 +953,7 @@ async function main() {
           (sr.message || sr.msg || ("接口返回异常: " + safeResponseSummary(sr)));
         log("签到失败: " + reward + "；状态复查=" + safeResponseSummary(signRecheck));
         if (unauthorizedConsumer(sr)) {
-          log("签到诊断: 当前可复现 Consumer 均无端点权限；请先更新 lynk_rewrite.conf，再在 APP 内手动点击签到捕获真实 POST");
+          log("签到诊断: 默认与 4.2.4 内置备用 Consumer 均无端点权限；请重新登录领克 APP 刷新 Token/设备信息后再试");
         } else if (usedFallbackConsumer) {
           log("签到诊断: 已尝试 4.2.4 内置备用 Consumer，服务端仍未确认签到");
         }
@@ -1073,19 +968,19 @@ async function main() {
   var results  = await Promise.all([energyP, growthP, tasksP]);
   var energyResp = results[0], growthResp = results[1], tasksResp = results[2];
 
-  var energyPoint = "-", energyTotal = "-";
-  var energyBeforeShare = energyPointFrom(energyResp);
+  var coPoint = "-", coTotal = "-";
   if (isOk(energyResp)) {
     var ed = energyResp.data || {};
-    energyPoint = ed.point != null ? String(ed.point) : "-";
-    energyTotal = ed.incomePoint != null ? String(ed.incomePoint) : "-";
+    coPoint = ed.point != null ? String(ed.point) : "-";
+    coTotal = ed.incomePoint != null ? String(ed.incomePoint) : "-";
   }
 
-  var growthName = "-", growthValue = "-";
+  var growthName = "-", rewardEnergy = "-";
+  var energyBeforeShare = rewardEnergyFrom(growthResp);
   if (isOk(growthResp)) {
     var lv = ((growthResp.data || {}).accountLevelVo) || {};
     growthName = lv.name || "-";
-    growthValue = lv.growth != null ? String(lv.growth) : "-";
+    rewardEnergy = lv.growth != null ? String(lv.growth) : "-";
   }
 
   var taskLines = [];
@@ -1113,10 +1008,10 @@ async function main() {
     log("签到后等待 " + SHARE_DELAY + " 秒再执行分享");
     await waitSeconds(SHARE_DELAY);
   }
-  var shareEnergyBaseline = { response: energyResp, point: energyBeforeShare };
+  var shareEnergyBaseline = { response: growthResp, point: energyBeforeShare };
   if (autoShareRequested) {
     // 等待结束后重取一次基线，避免把延迟到账的签到奖励误算成分享奖励。
-    shareEnergyBaseline = await readEnergyPoint(token);
+    shareEnergyBaseline = await readRewardEnergy(token);
     if (shareEnergyBaseline.point != null) energyBeforeShare = shareEnergyBaseline.point;
   }
   var shareContext = await getShareContext(token);
@@ -1125,9 +1020,9 @@ async function main() {
 
   // 5a. B 账号走 lookup → check → report，并核验主账号奖励变化。
   var energyCursor = energyBeforeShare;
-  var finalEnergyResp = shareEnergyBaseline.response || energyResp;
+  var finalEnergyResp = shareEnergyBaseline.response || growthResp;
   if (energyCursor == null) {
-    var energyProbe = await readEnergyPoint(token);
+    var energyProbe = await readRewardEnergy(token);
     energyCursor = energyProbe.point;
     finalEnergyResp = energyProbe.response;
   }
@@ -1173,11 +1068,7 @@ async function main() {
 
   // 通知显示分享后的最终余额，避免仍显示分享前数值。
   if (energyCursor != null) {
-    energyPoint = String(energyCursor);
-  }
-  if (isOk(finalEnergyResp)) {
-    var finalEnergyData = finalEnergyResp.data || {};
-    if (finalEnergyData.incomePoint != null) energyTotal = String(finalEnergyData.incomePoint);
+    rewardEnergy = String(energyCursor);
   }
 
   // 6. 构造通知
@@ -1188,8 +1079,8 @@ async function main() {
   var lines = [];
   lines.push(signResult + " | " + reward);
   lines.push("连续签到: " + streak + "天 | 补签卡: " + signCard + "张");
-  lines.push("能量体: " + energyPoint + " | 累计: " + energyTotal);
-  lines.push("等级: " + growthName + " | 成长值: " + growthValue);
+  lines.push("Co积分: " + coPoint + " | 累计积分: " + coTotal);
+  lines.push("能量体: " + rewardEnergy + " | 等级: " + growthName);
   if (taskLines.length > 0) {
     lines.push("---任务进度---");
     taskLines.forEach(function (l) { lines.push(l); });
