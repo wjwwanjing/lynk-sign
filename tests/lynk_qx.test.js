@@ -267,7 +267,7 @@ async function testSignUsesIosGatewayAuthAndCachesDate() {
     if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
     if (url.pathname.endsWith("/user/sign")) {
       assert.equal(url.hostname, "app-api-gw-toc.lynkco.com");
-      assert.equal(request.headers.Authorization, undefined);
+      assert.match(request.headers.Authorization, /^APPCODE /);
       assert.equal(request.headers.token, "main-access");
       assert.match(request.headers["X-Ca-Key"], /^\d+$/);
       assert.ok(request.headers["X-Ca-Signature"]);
@@ -301,7 +301,7 @@ async function testSignSupportsPathOverride() {
     if (url.pathname === "/up/api/v2/user/sign") {
       assert.equal(url.hostname, "app-api-gw-toc.lynkco.com");
       assert.ok(request.headers["X-Ca-Key"]);
-      assert.equal(request.headers.Authorization, undefined);
+      assert.match(request.headers.Authorization, /^APPCODE /);
       assert.equal(request.headers.token, "main-access");
       return { code: "success", data: {} };
     }
@@ -331,7 +331,7 @@ async function testSignRetriesWith424Consumer() {
     if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
     if (url.pathname.endsWith("/user/sign")) {
       signPosts += 1;
-      assert.equal(request.headers.Authorization, undefined);
+      assert.match(request.headers.Authorization, /^APPCODE /);
       assert.equal(request.headers.token, "main-access");
       assert.ok(request.headers["X-Ca-Signature"]);
       if (signPosts === 1) {

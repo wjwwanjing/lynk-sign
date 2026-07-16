@@ -492,19 +492,17 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
-// 签到端点：与两个参考仓库（spritekite / xbgo）一致，固定 POST /up/api/v1/user/sign，
-// 只带 token + X-Ca 签名，不带 APPCODE。lynk_sign_path 可在新版网关迁移路径时覆盖。
+// 签到端点：固定 POST /up/api/v1/user/sign，lynk_sign_path 可在新版网关迁移路径时覆盖。
 function signPath() {
   return SIGN_PATH_PREF && SIGN_PATH_PREF.charAt(0) === "/" ? SIGN_PATH_PREF : DEFAULT_SIGN_PATH;
 }
 
+// 签到 POST 与其它业务请求一样带 APPCODE + token + X-Ca 签名。
+// 4.2.4 网关对不带 APPCODE 的签到 POST 返回 Unauthorized Consumer；xbgo 参考实现每个请求都带 APPCODE。
 // caKey/caSecret 留空时由 hmacSign 回退到默认 Consumer；仅 403 Unauthorized Consumer 时才传入备用 Consumer。
 function apiPostSign(token, body, caKey, caSecret) {
   var bs = buildUrlAndSign("POST", signPath(), null, caKey, caSecret);
-  var headers = Object.assign({}, bs.sig, {
-    "content-type": "application/json",
-    "token": token,
-  });
+  var headers = Object.assign({}, bs.sig, businessHeaders(token));
   return httpPost(bs.url, headers, body || {});
 }
 
@@ -914,7 +912,7 @@ async function main() {
     if (!signedFromCache) rememberSignedToday();
     log("今日已签到" + (signedFromDayInfo ? " (day/info确认)" : (signedFromCache ? " (本地成功记录)" : "")));
   } else {
-    log("签到: POST " + signPath() + "，token + X-Ca 签名，不带 APPCODE");
+    log("签到: POST " + signPath() + "，APPCODE + token + X-Ca 签名");
     var sr = await apiPostSign(token, {});
     var usedFallbackConsumer = false;
     if (unauthorizedConsumer(sr)) {
