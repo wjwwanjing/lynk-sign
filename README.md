@@ -204,7 +204,8 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 
 - **businessNo** 来源：优先从社区信息流 `square/index2` 取第一篇真实文章 ID；取不到才回退到配置的 `lynk_share_cid`。用真实文章而非固定 ID，更贴近官方 APP 行为。
 - **shareReporting 不带 token，但不能省略 APPCODE**：`xbgo/lynkco-daily` 的请求构造器即使在 `token_required=False` 时仍保留 `Authorization: APPCODE ...`。旧 QX 版把这两个头一起删掉，是点击回调不能正常记账的主要问题。
-- **签到请求**：固定 `POST app-api-gw-toc + /up/api/v1/user/sign`，带 `Authorization: APPCODE ...` + `token` + `X-Ca-*` 签名。4.2.4 网关对签到 POST 要求携带 APPCODE，缺失会返回 `403 Unauthorized Consumer`（GET 状态查询不需要）；`xbgo/lynkco-daily` 的请求构造器在所有请求上都保留 APPCODE。若后续网关迁移路径，可用 `lynk_sign_path` 覆盖端点。`getShareCode` 额外带 `use_security: true` / `risk_type: 1` / `appVersion` / `risk_request_info`。
+- **签到请求**：默认 `POST app-api-gw-toc + /up/api/v1/user/sign`，带 `Authorization: APPCODE ...` + `token` + `X-Ca-*` 签名。但在部分 4.2.4 网关上，内置 Consumer（`204644386` / 备用 `203760416`）对该端点无权限，会返回 `403 Unauthorized Consumer`（同一 Key 的 GET 状态查询和分享 POST 都正常，说明是「该 Key 未被授权这条 API」而非路径或 Token 问题）。此时脚本会**自动套用 `lynk_sign_capture.js` 捕获到的真实签到 POST**（host/path/Key/是否带 APPCODE），无捕获时退回默认端点并做一次备用 Consumer 重试。若后续网关迁移路径，也可用 `lynk_sign_path` 手动覆盖端点。`getShareCode` 额外带 `use_security: true` / `risk_type: 1` / `appVersion` / `risk_request_info`。
+- **签到捕获的精确判定（修复旧 bug）**：`lynk_sign_capture.js` 只把「响应带签到奖励字段（`rewardEnergyNumber` 等）或明确签到成功文案」的 POST 认定为真实签到动作，状态探测（`/sign/info`、`/day/info`、`getContinueDaysAndSignCard`）一律不会被误抓。捕获覆盖 `app-api-gw-toc.lynkco.com` 和 `app-gateway-common.lynkco.com` 两个生产网关。只有当捕获到的 `X-Ca-Key` 是我们持有签名密钥的 Consumer、且签名头格式可复现、非 CEP 鉴权时才自动重放；否则只记录诊断，不盲目套用。
 - **重试机制**：若 `getShareCode` 返回风控拦截（`share.need.validate.check`），等 3 秒重试 1 次（风控有短窗口限流）
 - **文章与分享码保持一致**：社区文章、风险头里的 H5 URL、`businessNo`、最终通知链接使用同一个文章 ID；不会再出现“最新文章取码、固定文章上报”的混用。
 - **成功判定**：接口成功只代表“上报已受理”。脚本会在分享动作前重取余额基线，并在点击回调后再次查询主账号 `/app/energy/myEnergy`；差值大于 0 才显示“奖励已到账”，避免把延迟到账的签到奖励误算成分享奖励。
@@ -256,7 +257,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 1. 先看日志（QX → 工具箱 → 脚本 → 日志）
 2. 最常见原因是 refreshToken 过期，重新抓包
 3. 如果提示"已签到"说明之前已经签过了，正常
-4. 如果执行签到提示 `403 Unauthorized Consumer`，说明网关没在授权列表里找到有效的 App 凭据。签到 POST 现在与其他业务请求一致，会带上 `Authorization: APPCODE ...` + `token` + `X-Ca-*` 签名（这是 4.2.4 网关对签到 POST 的要求，也是 `xbgo/lynkco-daily` 的做法）。若仍失败，脚本会自动用 4.2.4 内置的备用 Consumer 重试一次；再不行通常是网关把签到端点迁到了新路径，可抓包确认后用 `lynk_sign_path` 覆盖。
+4. 如果执行签到提示 `403 Unauthorized Consumer`，这是阿里云 API 网关的**按接口鉴权**错误，只跟 `X-Ca-Key` 有关，与 token / APPCODE 无关。它表示当前 `X-Ca-Key` 没有被授权访问**签到那条 POST 接口**——即便同一个 Key 能正常访问签到状态 GET 和分享 POST。参考仓库针对的是旧版本 APP，其内置 Key 在 4.2.4 网关上可能已不被授权访问 `/up/api/v1/user/sign`。**解决办法：在今天尚未签到时，进入领克 APP 手动点一次签到**，`lynk_sign_capture.js` 会精确捕获真实签到 POST（只认响应带 `rewardEnergyNumber` 等奖励字段的那一条，绝不会再误抓 `/sign/info` 状态探测），并覆盖两个生产网关（`app-api-gw-toc` 与 `app-gateway-common`）。下次运行脚本会自动套用捕获到的 host / path / Key。若捕获到的是脚本没有签名密钥的新 Key，会在日志里说明无法重放，此时把通知里的 host/path/Key/APPCODE 发回即可（不要发 Token、Authorization、X-Ca-Signature、nonce、timestamp）。
 
 **脚本怎么调试？**
 QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.log 输出。

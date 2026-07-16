@@ -1,16 +1,19 @@
 /**
- * 领克签到请求元数据捕获（Quantumult X response-body 重写脚本）
+ * 领克签到请求捕获（Quantumult X response-body 重写脚本）
  *
- * 在领克 APP 手动签到时记录诊断所需的非敏感元数据：
- *   - 请求 host/path/method
- *   - X-Ca-Key、X-Ca-Signature-Headers
- *   - 是否携带 APPCODE（不保存 Authorization 的值）
- *   - App/设备头的字段名、请求/响应 JSON 的字段名和响应状态
+ * 目的：在领克 APP 手动点一次签到时，精确识别「真正执行签到的那条 POST」，
+ * 记录复现签到所需的非敏感元数据（host / path / X-Ca-Key / 是否带 APPCODE 等），
+ * 供 lynk_qx.js 自动套用。
  *
- * 兼容新版 APP 将签到动作迁移到“不含 sign 的 URL”：重写规则会把
- * /up/api/vN/ 下的 POST 交给本脚本，本脚本仅保存字段名和安全头。
+ * ⚠️ 关键判定（修复旧版误抓 /sign/info 状态探测的 bug）：
+ *   只有当响应里带「签到奖励字段」(rewardEnergyNumber / rewardPointNumber /
+ *   rewardSignCardNumber) 或明确的「签到成功」文案时，才认定为真实签到动作。
+ *   纯状态查询 (/info、/day/info、getContinueDaysAndSignCard) 不含奖励字段，
+ *   因此不会再被误当成签到 POST。
  *
- * 明确不保存 token、Authorization、X-Ca-Signature、nonce、timestamp、
+ * 覆盖两个生产网关：app-api-gw-toc.lynkco.com 与 app-gateway-common.lynkco.com。
+ *
+ * 明确不保存 token、Authorization 值、X-Ca-Signature、nonce、timestamp、
  * 请求正文值、响应 data 值或设备标识值。
  */
 
@@ -20,6 +23,7 @@
     var method = String(request.method || "GET").toUpperCase();
     var url = String(request.url || "");
     var pathMatch = url.match(/^https?:\/\/([^/]+)(\/[^?#]*)/i);
+    var host = pathMatch ? pathMatch[1] : "";
     var path = pathMatch ? pathMatch[2] : "";
     var query = "";
     var queryIndex = url.indexOf("?");
@@ -68,28 +72,42 @@
     var responseDataKeys = responseData && typeof responseData === "object" && !Array.isArray(responseData) ?
       Object.keys(responseData).sort() : [];
     var responseText = String(responseJson && (responseJson.message || responseJson.msg || responseJson.code) || "");
-    var looksLikeSignResponse = /签到|sign/i.test(responseText) || responseDataKeys.some(function (key) {
-      return /reward(?:Energy|Point|SignCard)Number|signStatus|continueDays|continuousSignDays/i.test(key);
+
+    // —— 精确判定真实签到动作 ——
+    // 1) 响应带奖励字段 = 真的领到了签到奖励（状态查询绝不会有这些字段）
+    var responseHasReward = responseDataKeys.some(function (key) {
+      return /reward(?:Energy|Point|SignCard)Number/i.test(key);
     });
-    var exactSignPath = /\/sign(?:\/|$)/i.test(path);
-    var isSignPost = method === "POST" && (exactSignPath || looksLikeSignResponse);
-    var isCandidatePost = method === "POST" && /\/(?:up|app)\/api\/v\d+\/(?:user|userReward)(?:\/|$)/i.test(path);
+    // 2) 或响应明确说“签到成功/签到完成”
+    var responseSaysSigned = /签到成功|签到完成|sign\s*success|checkin\s*success/i.test(responseText);
+    // 明确的只读端点：即使响应偶然含 sign 字样也不当作签到动作
+    var lowerPath = path.toLowerCase();
+    var isReadEndpoint =
+      /\/(?:info|status|detail|list|query|day|summary|record|calendar|config|page|home)(?:\/|$)/.test(lowerPath) ||
+      /getcontinuedays|getsigncard|getsigninfo|day\/info|sign\/info|sign\/status/.test(lowerPath);
+
+    var isSignAction = method === "POST" && !isReadEndpoint && (responseHasReward || responseSaysSigned);
+
+    // 诊断用：user/userReward 下的其它 POST（未确认为签到动作）也单独存一份，便于排查，但不会被自动套用。
+    var isCandidatePost = method === "POST" &&
+      /\/(?:up|app)\/api\/v\d+\/(?:user|userReward)(?:\/|$)/i.test(path);
+    // 状态 GET 也留一份用于对照
     var isSignStatus = method === "GET" && (
       /\/user\/sign\/day\/info$/i.test(path) ||
       /\/userReward\/getContinueDaysAndSignCard$/i.test(path)
     );
 
-    // 已签到时 APP 不会再发 POST；状态 GET 仍保存。新版未知路径先按候选 POST 保存。
-    if (!isSignPost && !isCandidatePost && !isSignStatus) {
+    if (!isSignAction && !isCandidatePost && !isSignStatus) {
       $done({});
       return;
     }
 
-    var captureType = isSignPost ? "sign-post" : (isSignStatus ? "sign-status" : "sign-candidate-post");
+    var captureType = isSignAction ? "sign-post" :
+      (isSignStatus ? "sign-status" : "sign-candidate-post");
     var meta = {
       capturedAt: new Date().toISOString(),
       captureType: captureType,
-      host: pathMatch ? pathMatch[1] : "",
+      host: host,
       path: path,
       queryKeys: queryKeys(query),
       method: method,
@@ -108,6 +126,7 @@
       appVersion: lowerHeaders.gl_app_version || lowerHeaders.appversioncode || "",
       appBuild: lowerHeaders.gl_app_build || lowerHeaders.appversionname || "",
       hasUserAgent: !!lowerHeaders["user-agent"],
+      responseHasReward: responseHasReward,
       requestBodyKeys: jsonKeys(request.body || ""),
       deviceHeaderNames: Object.keys(lowerHeaders).filter(function (key) {
         return /device|gl_dev_|gl_app_|appversion|publicplatform|sweet_security/.test(key);
@@ -119,15 +138,15 @@
       responseDataKeys: responseDataKeys,
     };
 
-    var storageKey = isSignPost ? "lynk_sign_capture" :
+    var storageKey = isSignAction ? "lynk_sign_capture" :
       (isSignStatus ? "lynk_sign_status_capture" : "lynk_sign_candidate_capture");
     $prefs.setValueForKey(JSON.stringify(meta), storageKey);
     $notify(
-      isSignPost ? "领克签到请求已捕获" :
+      isSignAction ? "领克真实签到请求已捕获 ✓" :
         (isSignStatus ? "领克签到状态元数据已捕获" : "领克签到候选 POST 已捕获"),
       meta.method + " " + meta.host + meta.path,
       "X-Ca-Key=" + (meta.xCaKey || "无") + " | APPCODE=" + (meta.hasAppCode ? "有" : "无") +
-        " | CEP=" + (meta.hasCepAuthentication ? "有" : "无") +
+        " | 奖励字段=" + (responseHasReward ? "有" : "无") +
         " | APP=" + (meta.appVersion || "未知") +
         " | HTTP=" + (meta.responseStatus || "未知")
     );

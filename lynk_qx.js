@@ -492,18 +492,78 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
-// 签到端点：固定 POST /up/api/v1/user/sign，lynk_sign_path 可在新版网关迁移路径时覆盖。
+// 签到端点：默认 POST /up/api/v1/user/sign，lynk_sign_path 可覆盖。
 function signPath() {
   return SIGN_PATH_PREF && SIGN_PATH_PREF.charAt(0) === "/" ? SIGN_PATH_PREF : DEFAULT_SIGN_PATH;
 }
 
-// 签到 POST 与其它业务请求一样带 APPCODE + token + X-Ca 签名。
-// 4.2.4 网关对不带 APPCODE 的签到 POST 返回 Unauthorized Consumer；xbgo 参考实现每个请求都带 APPCODE。
-// caKey/caSecret 留空时由 hmacSign 回退到默认 Consumer；仅 403 Unauthorized Consumer 时才传入备用 Consumer。
-function apiPostSign(token, body, caKey, caSecret) {
-  var bs = buildUrlAndSign("POST", signPath(), null, caKey, caSecret);
-  var headers = Object.assign({}, bs.sig, businessHeaders(token));
-  return httpPost(bs.url, headers, body || {});
+// 我们只掌握这两个 Consumer 的签名密钥；APP 若换了新 X-Ca-Key，无密钥无法重放。
+function knownCaSecret(caKey) {
+  if (String(caKey) === CA_KEY) return CA_SECRET;
+  if (String(caKey) === SIGN_FALLBACK_CA_KEY) return SIGN_FALLBACK_CA_SECRET;
+  return "";
+}
+
+function sameSignatureHeaders(value) {
+  if (!value) return true; // 未记录时按默认格式处理
+  var normalize = function (text) {
+    return String(text).split(",").map(function (s) { return s.trim().toLowerCase(); })
+      .filter(Boolean).sort().join(",");
+  };
+  return normalize(value) === normalize(SIG_HDRS);
+}
+
+// 读取 lynk_sign_capture.js 精确捕获的真实签到 POST。
+// 只有响应确认带奖励字段(responseHasReward)、Key 密钥已知、签名头格式可复现时才自动采用。
+function capturedSignProfile() {
+  var raw = $prefs.valueForKey("lynk_sign_capture") || "";
+  if (!raw) return null;
+  try {
+    var m = JSON.parse(raw);
+    if (m.captureType !== "sign-post" || String(m.method).toUpperCase() !== "POST") return null;
+    if (!m.responseHasReward) return null; // 修复旧 bug：非奖励响应绝不当签到动作
+    var hostLc = String(m.host || "").toLowerCase();
+    if (hostLc !== "app-api-gw-toc.lynkco.com" && hostLc !== "app-gateway-common.lynkco.com") return null;
+    if (String(m.path || "").charAt(0) !== "/") return null;
+    var caSecret = knownCaSecret(m.xCaKey);
+    var supported = !!caSecret && sameSignatureHeaders(m.signatureHeaders) && !m.hasCepAuthentication;
+    return {
+      supported: supported,
+      unsupportedReason: !caSecret ? "捕获到未知 X-Ca-Key=" + (m.xCaKey || "无") + "（无签名密钥，无法重放）" :
+        (!sameSignatureHeaders(m.signatureHeaders) ? "捕获到不同的 X-Ca-Signature-Headers" :
+          (m.hasCepAuthentication ? "捕获请求使用 CEP 鉴权，无可安全重建的凭据" : "")),
+      baseUrl: "https://" + hostLc,
+      path: String(m.path),
+      caKey: String(m.xCaKey || CA_KEY),
+      caSecret: caSecret,
+      hasAppCode: !!m.hasAppCode,
+      useSecurity: !!m.useSecurity,
+      hasRiskType: !!m.hasRiskType,
+      xCaVersion: String(m.xCaVersion || ""),
+    };
+  } catch (_) { return null; }
+}
+
+// 签到 POST：优先用捕获到的真实请求 profile；否则用默认端点。
+// caKey/caSecret 留空 → hmacSign 回退默认 Consumer；仅 403 Unauthorized Consumer 时传入备用 Consumer。
+function apiPostSign(token, body, caKey, caSecret, profile) {
+  var base = API_BASE, path = signPath(), key = caKey, secret = caSecret;
+  var withAppCode = true, extra = {};
+  if (profile) {
+    base = profile.baseUrl;
+    path = profile.path;
+    // 若外层未指定备用 Consumer，则用捕获到的 Key/密钥
+    if (!key) { key = profile.caKey; secret = profile.caSecret; }
+    withAppCode = profile.hasAppCode;
+    if (profile.useSecurity) extra.use_security = "true";
+    if (profile.hasRiskType) extra.risk_type = "1";
+    if (profile.xCaVersion) extra["x-ca-version"] = profile.xCaVersion;
+  }
+  var sig = hmacSign("POST", path, null, key, secret);
+  var headers = Object.assign({}, sig, { "content-type": "application/json", "token": token });
+  if (withAppCode) headers.Authorization = "APPCODE " + APP_CODE;
+  Object.assign(headers, extra);
+  return httpPost(base + path, headers, body || {});
 }
 
 // 不带 token，但仍带 APPCODE（与 H5 页面和 xbgo 参考实现一致）。
@@ -912,10 +972,22 @@ async function main() {
     if (!signedFromCache) rememberSignedToday();
     log("今日已签到" + (signedFromDayInfo ? " (day/info确认)" : (signedFromCache ? " (本地成功记录)" : "")));
   } else {
-    log("签到: POST " + signPath() + "，APPCODE + token + X-Ca 签名");
-    var sr = await apiPostSign(token, {});
+    var capProfile = capturedSignProfile();
+    if (capProfile && capProfile.supported) {
+      log("签到: 使用真实 APP 捕获 host=" + capProfile.baseUrl.replace(/^https?:\/\//, "") +
+        " path=" + capProfile.path + " X-Ca-Key=" + capProfile.caKey +
+        (capProfile.hasAppCode ? " +APPCODE" : "，不带 APPCODE"));
+    } else {
+      if (capProfile && !capProfile.supported) {
+        log("签到: 捕获配置未采用（" + capProfile.unsupportedReason + "），回退默认端点");
+      }
+      capProfile = null;
+      log("签到: POST " + signPath() + "，APPCODE + token + X-Ca 签名");
+    }
+    var sr = await apiPostSign(token, {}, null, null, capProfile);
     var usedFallbackConsumer = false;
-    if (unauthorizedConsumer(sr)) {
+    // 仅默认端点(未采用捕获)且默认 Consumer 无权限时，才用 4.2.4 内置备用 Consumer 重试。
+    if (!capProfile && unauthorizedConsumer(sr)) {
       usedFallbackConsumer = true;
       log("签到: 默认 Consumer 无端点权限，使用 4.2.4 内置备用 Consumer 重试一次");
       sr = await apiPostSign(token, {}, SIGN_FALLBACK_CA_KEY, SIGN_FALLBACK_CA_SECRET);
@@ -951,7 +1023,8 @@ async function main() {
           (sr.message || sr.msg || ("接口返回异常: " + safeResponseSummary(sr)));
         log("签到失败: " + reward + "；状态复查=" + safeResponseSummary(signRecheck));
         if (unauthorizedConsumer(sr)) {
-          log("签到诊断: 默认与 4.2.4 内置备用 Consumer 均无端点权限；请重新登录领克 APP 刷新 Token/设备信息后再试");
+          log("签到诊断: 内置 Consumer 对该端点无权限。请在今天尚未签到时，进入领克 APP 手动点一次签到，" +
+            "lynk_sign_capture.js 会捕获真实签到 POST（需带奖励字段），下次运行自动套用其 host/path/Key。");
         } else if (usedFallbackConsumer) {
           log("签到诊断: 已尝试 4.2.4 内置备用 Consumer，服务端仍未确认签到");
         }
