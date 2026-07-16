@@ -47,6 +47,9 @@ assert.equal(meta.xCaKey, "new-key-123");
 assert.equal(meta.hasAppCode, true);
 assert.equal(meta.hasToken, true);
 assert.equal(meta.appVersion, "5.0.0");
+assert.deepEqual(Array.from(meta.queryKeys), ["ignored"]);
+assert.deepEqual(Array.from(meta.requestBodyKeys), ["private"]);
+assert.deepEqual(Array.from(meta.responseDataKeys), ["private"]);
 assert.deepEqual(Array.from(meta.deviceHeaderNames), ["gl_app_version", "gl_dev_id"]);
 assert.equal(doneCount, 1);
 assert.equal(notifications.length, 1);
@@ -111,3 +114,49 @@ assert.equal(statusSaved.lynk_sign_status_capture.includes("status-secret-app-co
 assert.equal(statusSaved.lynk_sign_status_capture.includes("status-signature-secret"), false);
 
 console.log("lynk_sign status capture tests passed");
+
+const candidateSaved = {};
+const candidateNotifications = [];
+vm.runInNewContext(source, {
+  $request: {
+    url: "https://app-api-gw-toc.lynkco.com/up/api/v2/userReward/dailyAction?scene=calendar",
+    method: "POST",
+    headers: {
+      token: "candidate-secret-token",
+      "X-Ca-Key": "candidate-key",
+      "X-Ca-Signature": "candidate-signature-secret",
+      gl_app_build: "50200001",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ action: "private-value", source: "private-value" }),
+  },
+  $response: {
+    statusCode: 403,
+    body: JSON.stringify({ code: "403", message: "Unauthorized Consumer" }),
+  },
+  $prefs: {
+    setValueForKey(value, key) { candidateSaved[key] = value; return true; },
+  },
+  $notify(title, subtitle, body) { candidateNotifications.push({ title, subtitle, body }); },
+  $done() {},
+  JSON,
+  String,
+  Object,
+  Date,
+  Array,
+  decodeURIComponent,
+});
+
+const candidateMeta = JSON.parse(candidateSaved.lynk_sign_candidate_capture);
+assert.equal(candidateMeta.captureType, "sign-candidate-post");
+assert.equal(candidateMeta.path, "/up/api/v2/userReward/dailyAction");
+assert.deepEqual(Array.from(candidateMeta.queryKeys), ["scene"]);
+assert.deepEqual(Array.from(candidateMeta.requestBodyKeys), ["action", "source"]);
+assert.equal(candidateMeta.responseStatus, 403);
+assert.equal(candidateNotifications.length, 1);
+assert.match(candidateNotifications[0].title, /候选 POST/);
+for (const secret of ["candidate-secret-token", "candidate-signature-secret", "private-value"]) {
+  assert.equal(JSON.stringify(candidateSaved).includes(secret), false, `candidate metadata leaked: ${secret}`);
+}
+
+console.log("lynk_sign candidate capture tests passed");

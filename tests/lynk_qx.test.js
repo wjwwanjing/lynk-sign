@@ -349,6 +349,62 @@ async function testSignRetriesWith424Consumer() {
   assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
 }
 
+async function testCapturedSignProfileIsReplayed() {
+  const captured = {
+    captureType: "sign-post",
+    method: "POST",
+    host: "app-api-gw-toc.lynkco.com",
+    path: "/up/api/v2/user/dailyCheckIn",
+    xCaKey: "204644386",
+    signatureHeaders: "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
+    hasAppCode: true,
+    hasCepAuthentication: false,
+    useSecurity: true,
+    hasRiskType: true,
+    contentType: "application/json",
+    accept: "*/*",
+    publicPlatform: "iOS",
+    appVersion: "4.2.4",
+    appBuild: "40204067",
+    xCaVersion: "1",
+    deviceHeaderNames: ["gl_app_version", "gl_app_build", "gl_dev_id"],
+  };
+  let signPosts = 0;
+  const result = await runQx({
+    lynk_refresh_token: "main-refresh",
+    lynk_device_id: "main-device",
+    lynk_self_share: "0",
+    lynk_share_delay: "0",
+    lynk_sign_capture: JSON.stringify(captured),
+  }, async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/auth/login/refresh")) {
+      return { code: "success", data: { centerTokenDto: { token: "main-access" } } };
+    }
+    if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
+    if (url.pathname === "/up/api/v2/user/dailyCheckIn") {
+      signPosts += 1;
+      assert.equal(request.headers["X-Ca-Key"], "204644386");
+      assert.match(request.headers.Authorization, /^APPCODE /);
+      assert.equal(request.headers.use_security, "true");
+      assert.equal(request.headers.risk_type, "1");
+      assert.equal(request.headers.publicplatform, "iOS");
+      assert.equal(request.headers.gl_app_version, "4.2.4");
+      assert.equal(request.headers.gl_app_build, "40204067");
+      assert.equal(request.headers.gl_dev_id, "main-device");
+      return { code: "success", data: { rewardEnergyNumber: 1 } };
+    }
+    if (url.pathname === "/app/energy/myEnergy") return { code: "success", data: { point: 821, incomePoint: 1021 } };
+    if (url.pathname === "/app/energy/my/growth") return { code: "success", data: {} };
+    if (url.pathname.endsWith("getTaskList")) return { code: "success", data: [] };
+    if (url.pathname.endsWith("square/index2")) return { code: "success", data: [{ articleId: "article-captured" }] };
+    if (url.pathname.endsWith("getShareCode")) return { code: "success", data: "code-captured" };
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+
+  assert.equal(signPosts, 1);
+  assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
+}
 async function testLocalSignDateSkipsDuplicatePost() {
   const today = new Date();
   const dateKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
@@ -418,6 +474,7 @@ async function testDayInfoSkipsDuplicateSignPost() {
   await testSignUsesIosGatewayAuthAndCachesDate();
   await testSignSupportsPathOverride();
   await testSignRetriesWith424Consumer();
+  await testCapturedSignProfileIsReplayed();
   await testLocalSignDateSkipsDuplicatePost();
   await testDayInfoSkipsDuplicateSignPost();
   console.log("lynk_qx tests passed");

@@ -187,7 +187,7 @@ lynk_token_b = bearerB账号1的refreshToken,bearerB账号2的refreshToken
 
 ### 方式 B：自助分享任务（不配小号，迁移自 xbgo/lynkco-daily）
 
-**没配 `lynk_token_b` 时**，脚本会用**主账号自身**完成整套分享任务上报——**无需任何小号**。这套链路迁移自 [xbgo/lynkco-daily](https://github.com/xbgo/lynkco-daily) 的实测有效实现。
+**没配 `lynk_token_b` 时**，脚本会尝试用**主账号自身**完成两步分享任务上报。这套请求链路参考 [xbgo/lynkco-daily](https://github.com/xbgo/lynkco-daily)，但当前实机结果表明：两步接口都返回 `success` 时，领克服务端仍可能不把同账号匿名回调认定为有效外部点击。
 
 **关键原理**：分享加分分两部分——"我分享了内容" + "有人点击阅读了我的分享"。脚本通过以下方式同时完成这两步：
 - `reporting?type=99` **带 token** = 上报"我分享了这个内容"
@@ -204,7 +204,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 
 - **businessNo** 来源：优先从社区信息流 `square/index2` 取第一篇真实文章 ID；取不到才回退到配置的 `lynk_share_cid`。用真实文章而非固定 ID，更贴近官方 APP 行为。
 - **shareReporting 不带 token，但不能省略 APPCODE**：`xbgo/lynkco-daily` 的请求构造器即使在 `token_required=False` 时仍保留 `Authorization: APPCODE ...`。旧 QX 版把这两个头一起删掉，是点击回调不能正常记账的主要问题。
-- **请求头与参考实现一致**：大部分业务请求带 `Authorization: APPCODE ...`；签到 `/up/api/v1/user/sign` 只带 `token + X-Ca-*`，不混入 Android 的 APPCODE/CEP 格式。若实机状态接口所用 consumer 对签到端点返回 `Unauthorized Consumer`，脚本会使用 4.2.4 IPA 内置的另一组生产 consumer 做一次受控重试；`getShareCode` 额外带 `use_security: true` / `risk_type: 1` / `appVersion` / `risk_request_info`（含 `openTimeStamp`、`shareContentType=1`、`shareContentURL`）。风险头在签名后合并，不参与网关签名。
+- **签到默认请求保持 d6549ff 格式**：默认仍是 `app-api-gw-toc + /up/api/v1/user/sign + token + X-Ca-*`，不带 APPCODE/CEP。若 `lynk_sign_capture.js` 捕获到可复现的真实签到 POST，脚本会采用捕获的 host/path 和安全头；未知 X-Ca-Key、不同签名头或 CEP 请求只提示诊断，不会盲目重放。`getShareCode` 额外带 `use_security: true` / `risk_type: 1` / `appVersion` / `risk_request_info`。
 - **重试机制**：若 `getShareCode` 返回风控拦截（`share.need.validate.check`），等 3 秒重试 1 次（风控有短窗口限流）
 - **文章与分享码保持一致**：社区文章、风险头里的 H5 URL、`businessNo`、最终通知链接使用同一个文章 ID；不会再出现“最新文章取码、固定文章上报”的混用。
 - **成功判定**：接口成功只代表“上报已受理”。脚本会在分享动作前重取余额基线，并在点击回调后再次查询主账号 `/app/energy/myEnergy`；差值大于 0 才显示“奖励已到账”，避免把延迟到账的签到奖励误算成分享奖励。
@@ -256,7 +256,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 1. 先看日志（QX → 工具箱 → 脚本 → 日志）
 2. 最常见原因是 refreshToken 过期，重新抓包
 3. 如果提示"已签到"说明之前已经签过了，正常
-4. 如果执行签到提示 `403 Unauthorized Consumer`，新版脚本会自动用 4.2.4 IPA 中确认存在的备用 consumer 重试一次，不需要手工改 Key。若两组 consumer 都失败，先不要套用 Android 的 `app-services + CEP` 请求格式；该格式在当前 iOS/QX 实测为网络异常。请在下一次尚未签到时先用领克 APP 手动签到，让 `lynk_sign_capture` 捕获真实 POST 元数据。已经签到时只能捕获 `/user/sign/day/info` 或 `getContinueDaysAndSignCard` 状态 GET；`userSignTip/getTipConfig` 等提示配置接口会被忽略。捕获内容不会保存 Token、签名或请求正文值。
+4. 如果执行签到提示 `403 Unauthorized Consumer`，说明 accessToken 已经通过前置查询，但当前 X-Ca consumer 没有签到 POST 端点权限。更新 `lynk_rewrite.conf` 后，在尚未签到的当天进入领克 APP 手动点击签到：新版捕获规则会覆盖两个业务网关下 `user` / `userReward` 范围的业务请求，即使新路径不含 `sign` 也会以“签到候选 POST”通知。请把通知中的 host/path/Key/APPCODE/CEP 和保存的脱敏元数据发回；不要发送 Token、Authorization、X-Ca-Signature、nonce 或 timestamp。
 
 **脚本怎么调试？**
 QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.log 输出。
@@ -269,7 +269,7 @@ QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.l
 `success` 只表示服务端接受请求，不表示奖励一定入账。看通知和日志中的余额差值：
 
 - `奖励已到账 +N`：已确认余额增加
-- `两步/三步上报成功，但能量余额未变化`：请求成功但没有新奖励，常见于今日已领取、风控或后端规则变化
+- `两步/三步上报成功，但能量余额未变化`：没有获得新奖励。当前同账号自助点击已实测出现此结果，更可靠的方案是使用独立 B 账号走三步点击，或让真实外部访客打开分享链接
 - `getShareCode ...`：取分享码失败，重点检查 `risk_request_info`、设备 ID 和 App 版本
 - `点击回调失败 ...`：重点检查匿名回调是否带 APPCODE、是否不带 token
 
