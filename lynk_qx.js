@@ -53,7 +53,7 @@ const CONFIG = {
   SHARE_DELAY:  "10", // 签到完成后等待再分享
   VERIFY_DELAY: "3",  // 点击回调后等待服务端记账
   SELF_SHARE:   "1",  // 单步自助分享开关："1"开/"0"关；没配小号时用主账号自身上报（实验性）
-  SIGN_PATH:    "/up/api/v1/user/sign",
+  SIGN_PATH:    "/up/api/v1/user/sign/upgrade",
 };
 
 // 方法二：QX 偏好设置读取（有值则覆盖上面的 CONFIG）
@@ -78,17 +78,16 @@ const API_BASE   = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_BASE = "https://app-services.lynkco.com.cn";
 const CA_KEY     = "204644386";
 const CA_SECRET  = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
-// 4.2.4 正版 IPA 的 CarWidget / CarShareExtension 运行时数据中同时存在的生产 consumer。
-// 它不是签到专用配置，因此只在默认 consumer 明确返回 Unauthorized Consumer 时用于一次重试。
-const SIGN_FALLBACK_CA_KEY = "203760416";
-const SIGN_FALLBACK_CA_SECRET = "IbyhE02AwkUzvupDon3xTZ3JIeddlppP";
+// 4.2.4 真机签到 POST /user/sign/upgrade 使用的生产 Consumer。
+const SIGN_CA_KEY = "203760416";
+const SIGN_CA_SECRET = "IbyhE02AwkUzvupDon3xTZ3JIeddlppP";
 const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method";
 const APP_VERSION      = "4.2.4";   // APP 版本号（与 doRefresh 一致）
 const APP_VERSION_CODE = "40204067"; // APP build 号（来自 4.2.4 IPA）
 const SHARE_H5_BASE = "https://h5.lynkco.com";
 const SIGN_PATH_PREF = String($prefs.valueForKey("lynk_sign_path") || "");
-const DEFAULT_SIGN_PATH = String(CONFIG.SIGN_PATH || "/up/api/v1/user/sign");
+const DEFAULT_SIGN_PATH = String(CONFIG.SIGN_PATH || "/up/api/v1/user/sign/upgrade");
 
 // ===================== 纯 JS 加密实现（无外部依赖，已与 Node crypto 逐字节比对验证）=====================
 // 阿里云 API 网关要求 HMAC-SHA256 签名。QX 的 JS 环境不保证有 $crypto，
@@ -293,6 +292,7 @@ function hmacSign(method, path, params, caKey, caSecret, signatureOptions) {
   signatureOptions = signatureOptions || {};
   var accept = signatureOptions.accept || "*/*";
   var contentType = signatureOptions.contentType || "application/json";
+  var signatureHeaders = String(signatureOptions.signatureHeaders || SIG_HDRS);
   var t = ts();
   var n = nonce();
 
@@ -304,30 +304,53 @@ function hmacSign(method, path, params, caKey, caSecret, signatureOptions) {
     if (sorted) url = path + "?" + sorted;
   }
 
+  var signedValues = {
+    "x-ca-key": caKey,
+    "x-ca-timestamp": t,
+    "x-ca-nonce": n,
+    "x-ca-signature-method": "HmacSHA256",
+    "x-ca-stage": "RELEASE",
+    "accept": accept,
+    "content-type": contentType,
+  };
+  var providedValues = signatureOptions.signedHeaderValues || {};
+  Object.keys(providedValues).forEach(function (name) {
+    signedValues[String(name).toLowerCase()] = String(providedValues[name]);
+  });
+
+  // X-Ca-Signature-Headers 可因 APP 模块不同而增减。签名串必须使用捕获到的
+  // 名称、集合和对应值，不能继续固定为旧版四项。
+  var signedNames = signatureHeaders.split(",").map(function (name) { return name.trim(); }).filter(Boolean);
+  signedNames.sort(function (a, b) {
+    a = a.toLowerCase(); b = b.toLowerCase();
+    return a < b ? -1 : (a > b ? 1 : 0);
+  });
+  var canonicalHeaders = signedNames.map(function (name) {
+    var value = signedValues[name.toLowerCase()];
+    if (value == null) throw new Error("无法重建签名头: " + name);
+    return name + ":" + value;
+  });
+
   var parts = [
     method.toUpperCase(),
     accept,
     "",
     contentType,
     "",
-    "X-Ca-Key:" + caKey,
-    "X-Ca-Nonce:" + n,
-    "X-Ca-Signature-Method:HmacSHA256",
-    "X-Ca-Timestamp:" + t,
-    url,
-  ];
+  ].concat(canonicalHeaders).concat([url]);
   var strToSign = parts.join("\n");
   var sig = hmacSha256Base64(caSecret, strToSign);
 
-  return {
+  var result = {
     "X-Ca-Key": caKey,
     "X-Ca-Timestamp": t,
     "X-Ca-Nonce": n,
     "X-Ca-Signature-Method": "HmacSHA256",
-    "X-Ca-Signature-Headers": SIG_HDRS,
+    "X-Ca-Signature-Headers": signatureHeaders,
     "X-Ca-Signature": sig,
     "Accept": accept,
   };
+  return result;
 }
 
 // 带查询串的 GET（签名里把 query 一并签进去，与 QX 网关一致）
@@ -492,29 +515,39 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
-// 签到端点：默认 POST /up/api/v1/user/sign，lynk_sign_path 可覆盖。
+// 4.2.4 真机已确认签到动作是 POST /up/api/v1/user/sign/upgrade。
+// 旧版调试过程中若把 /user/sign 写入偏好设置，也自动迁移到已确认的新端点。
 function signPath() {
+  if (SIGN_PATH_PREF === "/up/api/v1/user/sign") return DEFAULT_SIGN_PATH;
   return SIGN_PATH_PREF && SIGN_PATH_PREF.charAt(0) === "/" ? SIGN_PATH_PREF : DEFAULT_SIGN_PATH;
 }
 
 // 我们只掌握这两个 Consumer 的签名密钥；APP 若换了新 X-Ca-Key，无密钥无法重放。
 function knownCaSecret(caKey) {
   if (String(caKey) === CA_KEY) return CA_SECRET;
-  if (String(caKey) === SIGN_FALLBACK_CA_KEY) return SIGN_FALLBACK_CA_SECRET;
+  if (String(caKey) === SIGN_CA_KEY) return SIGN_CA_SECRET;
   return "";
 }
 
-function sameSignatureHeaders(value) {
-  if (!value) return true; // 未记录时按默认格式处理
-  var normalize = function (text) {
-    return String(text).split(",").map(function (s) { return s.trim().toLowerCase(); })
-      .filter(Boolean).sort().join(",");
+function signatureHeaderNames(value) {
+  return String(value || SIG_HDRS).split(",").map(function (s) { return s.trim().toLowerCase(); })
+    .filter(Boolean);
+}
+
+function unsupportedSignatureHeaders(value) {
+  var supported = {
+    "x-ca-key": 1, "x-ca-timestamp": 1, "x-ca-nonce": 1,
+    "x-ca-signature-method": 1, "x-ca-stage": 1, "x-ca-version": 1,
+    "token": 1, "authorization": 1, "accept": 1, "content-type": 1,
+    "publicplatform": 1, "gl_dev_id": 1, "gl_app_version": 1,
+    "gl_app_build": 1, "appversioncode": 1, "appversionname": 1,
+    "user-agent": 1, "use_security": 1, "risk_type": 1,
   };
-  return normalize(value) === normalize(SIG_HDRS);
+  return signatureHeaderNames(value).filter(function (name) { return !supported[name]; });
 }
 
 // 读取 lynk_sign_capture.js 精确捕获的真实签到 POST。
-// 只有响应确认带奖励字段(responseHasReward)、Key 密钥已知、签名头格式可复现时才自动采用。
+// 只有响应确认带奖励字段(responseHasReward)、Key 密钥已知、签名头值可复现时才自动采用。
 function capturedSignProfile() {
   var raw = $prefs.valueForKey("lynk_sign_capture") || "";
   if (!raw) return null;
@@ -526,43 +559,79 @@ function capturedSignProfile() {
     if (hostLc !== "app-api-gw-toc.lynkco.com" && hostLc !== "app-gateway-common.lynkco.com") return null;
     if (String(m.path || "").charAt(0) !== "/") return null;
     var caSecret = knownCaSecret(m.xCaKey);
-    var supported = !!caSecret && sameSignatureHeaders(m.signatureHeaders) && !m.hasCepAuthentication;
+    var unknownHeaders = unsupportedSignatureHeaders(m.signatureHeaders);
+    var hasUnknownBody = Array.isArray(m.requestBodyKeys) && m.requestBodyKeys.length > 0;
+    var hasUnknownQuery = Array.isArray(m.queryKeys) && m.queryKeys.length > 0;
+    var supported = !!caSecret && unknownHeaders.length === 0 && !m.hasCepAuthentication &&
+      !hasUnknownBody && !hasUnknownQuery;
     return {
       supported: supported,
       unsupportedReason: !caSecret ? "捕获到未知 X-Ca-Key=" + (m.xCaKey || "无") + "（无签名密钥，无法重放）" :
-        (!sameSignatureHeaders(m.signatureHeaders) ? "捕获到不同的 X-Ca-Signature-Headers" :
-          (m.hasCepAuthentication ? "捕获请求使用 CEP 鉴权，无可安全重建的凭据" : "")),
+        (unknownHeaders.length ? "存在无法重建的签名头: " + unknownHeaders.join(",") :
+          (m.hasCepAuthentication ? "捕获请求使用 CEP 鉴权，无可安全重建的凭据" :
+            (hasUnknownBody ? "签到正文包含未保存的字段值: " + m.requestBodyKeys.join(",") :
+              (hasUnknownQuery ? "签到 URL 包含未保存的查询值: " + m.queryKeys.join(",") : "")))),
       baseUrl: "https://" + hostLc,
       path: String(m.path),
       caKey: String(m.xCaKey || CA_KEY),
       caSecret: caSecret,
+      signatureHeaders: String(m.signatureHeaders || SIG_HDRS),
       hasAppCode: !!m.hasAppCode,
       useSecurity: !!m.useSecurity,
       hasRiskType: !!m.hasRiskType,
       xCaVersion: String(m.xCaVersion || ""),
+      xCaStage: String(m.xCaStage || (signatureHeaderNames(m.signatureHeaders).indexOf("x-ca-stage") >= 0 ? "RELEASE" : "")),
+      contentType: String(m.contentType || "application/json"),
+      accept: String(m.accept || "*/*"),
+      publicPlatform: String(m.publicPlatform || "iOS"),
+      appVersion: String(m.appVersion || APP_VERSION),
+      appBuild: String(m.appBuild || APP_VERSION_CODE),
+      userAgent: m.hasUserAgent ? String(m.userAgent || "CA_iOS_SDK_2.0") : "",
+      deviceHeaderNames: Array.isArray(m.deviceHeaderNames) ? m.deviceHeaderNames : [],
     };
   } catch (_) { return null; }
 }
 
-// 签到 POST：优先用捕获到的真实请求 profile；否则用默认端点。
-// caKey/caSecret 留空 → hmacSign 回退默认 Consumer；仅 403 Unauthorized Consumer 时传入备用 Consumer。
+// 签到 POST：优先用捕获到的真实请求 profile；无捕获时使用 4.2.4 真机确认的
+// /sign/upgrade + 203760416 + 无 APPCODE 组合。
 function apiPostSign(token, body, caKey, caSecret, profile) {
-  var base = API_BASE, path = signPath(), key = caKey, secret = caSecret;
-  var withAppCode = true, extra = {};
+  var base = API_BASE, path = signPath();
+  var key = caKey || "";
+  var secret = caSecret || "";
+  var withAppCode = false;
+  var requestHeaders = { "content-type": "application/json", "token": token };
+  var signatureOptions = {};
   if (profile) {
     base = profile.baseUrl;
     path = profile.path;
     // 若外层未指定备用 Consumer，则用捕获到的 Key/密钥
     if (!key) { key = profile.caKey; secret = profile.caSecret; }
     withAppCode = profile.hasAppCode;
-    if (profile.useSecurity) extra.use_security = "true";
-    if (profile.hasRiskType) extra.risk_type = "1";
-    if (profile.xCaVersion) extra["x-ca-version"] = profile.xCaVersion;
+    requestHeaders["content-type"] = profile.contentType;
+    requestHeaders.publicplatform = profile.publicPlatform;
+    if (profile.xCaStage) requestHeaders["x-ca-stage"] = profile.xCaStage;
+    if (profile.useSecurity) requestHeaders.use_security = "true";
+    if (profile.hasRiskType) requestHeaders.risk_type = "1";
+    if (profile.xCaVersion) requestHeaders["x-ca-version"] = profile.xCaVersion;
+    if (profile.userAgent) requestHeaders["user-agent"] = profile.userAgent;
+    profile.deviceHeaderNames.forEach(function (name) {
+      var lower = String(name).toLowerCase();
+      if (lower === "gl_dev_id") requestHeaders[name] = DEVICE_ID;
+      else if (lower === "gl_app_version" || lower === "appversioncode") requestHeaders[name] = profile.appVersion;
+      else if (lower === "gl_app_build" || lower === "appversionname") requestHeaders[name] = profile.appBuild;
+    });
+    signatureOptions = {
+      accept: profile.accept,
+      contentType: profile.contentType,
+      signatureHeaders: profile.signatureHeaders,
+      signedHeaderValues: requestHeaders,
+    };
   }
-  var sig = hmacSign("POST", path, null, key, secret);
-  var headers = Object.assign({}, sig, { "content-type": "application/json", "token": token });
-  if (withAppCode) headers.Authorization = "APPCODE " + APP_CODE;
-  Object.assign(headers, extra);
+  if (!key) { key = SIGN_CA_KEY; secret = SIGN_CA_SECRET; }
+  if (withAppCode) requestHeaders.Authorization = "APPCODE " + APP_CODE;
+  signatureOptions.signedHeaderValues = requestHeaders;
+  var sig = hmacSign("POST", path, null, key, secret, signatureOptions);
+  var headers = Object.assign({}, requestHeaders, sig);
   return httpPost(base + path, headers, body || {});
 }
 
@@ -976,23 +1045,16 @@ async function main() {
     if (capProfile && capProfile.supported) {
       log("签到: 使用真实 APP 捕获 host=" + capProfile.baseUrl.replace(/^https?:\/\//, "") +
         " path=" + capProfile.path + " X-Ca-Key=" + capProfile.caKey +
-        (capProfile.hasAppCode ? " +APPCODE" : "，不带 APPCODE"));
+        (capProfile.hasAppCode ? " +APPCODE" : "，不带 APPCODE") +
+        "，签名头=" + capProfile.signatureHeaders);
     } else {
       if (capProfile && !capProfile.supported) {
         log("签到: 捕获配置未采用（" + capProfile.unsupportedReason + "），回退默认端点");
       }
       capProfile = null;
-      log("签到: POST " + signPath() + "，APPCODE + token + X-Ca 签名");
+      log("签到: POST " + signPath() + "，X-Ca-Key=" + SIGN_CA_KEY + " + token，不带 APPCODE");
     }
     var sr = await apiPostSign(token, {}, null, null, capProfile);
-    var usedFallbackConsumer = false;
-    // 仅默认端点(未采用捕获)且默认 Consumer 无权限时，才用 4.2.4 内置备用 Consumer 重试。
-    if (!capProfile && unauthorizedConsumer(sr)) {
-      usedFallbackConsumer = true;
-      log("签到: 默认 Consumer 无端点权限，使用 4.2.4 内置备用 Consumer 重试一次");
-      sr = await apiPostSign(token, {}, SIGN_FALLBACK_CA_KEY, SIGN_FALLBACK_CA_SECRET);
-      log("签到备用 Consumer: " + safeResponseSummary(sr));
-    }
     if (isOk(sr)) {
       signResult = "签到成功";
       rememberSignedToday();
@@ -1023,10 +1085,7 @@ async function main() {
           (sr.message || sr.msg || ("接口返回异常: " + safeResponseSummary(sr)));
         log("签到失败: " + reward + "；状态复查=" + safeResponseSummary(signRecheck));
         if (unauthorizedConsumer(sr)) {
-          log("签到诊断: 内置 Consumer 对该端点无权限。请在今天尚未签到时，进入领克 APP 手动点一次签到，" +
-            "lynk_sign_capture.js 会捕获真实签到 POST（需带奖励字段），下次运行自动套用其 host/path/Key。");
-        } else if (usedFallbackConsumer) {
-          log("签到诊断: 已尝试 4.2.4 内置备用 Consumer，服务端仍未确认签到");
+          log("签到诊断: 当前请求仍被 Consumer 权限拒绝；请核对日志中的实际 path、Key 和签名头是否来自最新捕获。");
         }
       }
     }

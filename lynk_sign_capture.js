@@ -114,6 +114,7 @@
       xCaKey: lowerHeaders["x-ca-key"] || "",
       signatureHeaders: lowerHeaders["x-ca-signature-headers"] || "",
       xCaVersion: lowerHeaders["x-ca-version"] || "",
+      xCaStage: lowerHeaders["x-ca-stage"] || "",
       hasAppCode: /^APPCODE\s+/i.test(auth),
       hasCepAuthentication: /^AppId=/i.test(lowerHeaders.authentication || ""),
       hasTenantId: !!lowerHeaders.tenantid,
@@ -126,6 +127,7 @@
       appVersion: lowerHeaders.gl_app_version || lowerHeaders.appversioncode || "",
       appBuild: lowerHeaders.gl_app_build || lowerHeaders.appversionname || "",
       hasUserAgent: !!lowerHeaders["user-agent"],
+      userAgent: lowerHeaders["user-agent"] || "",
       responseHasReward: responseHasReward,
       requestBodyKeys: jsonKeys(request.body || ""),
       deviceHeaderNames: Object.keys(lowerHeaders).filter(function (key) {

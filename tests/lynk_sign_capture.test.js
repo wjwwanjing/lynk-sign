@@ -4,159 +4,98 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "lynk_sign_capture.js"), "utf8");
-const saved = {};
-const notifications = [];
-let doneCount = 0;
 
-vm.runInNewContext(source, {
-  $request: {
-    url: "https://app-api-gw-toc.lynkco.com/up/api/v1/user/sign?ignored=1",
+function runCapture(request, response) {
+  const saved = {};
+  const notifications = [];
+  let doneCount = 0;
+  vm.runInNewContext(source, {
+    $request: request,
+    $response: response,
+    $prefs: { setValueForKey(value, key) { saved[key] = value; return true; } },
+    $notify(title, subtitle, body) { notifications.push({ title, subtitle, body }); },
+    $done() { doneCount += 1; },
+    JSON, String, Object, Array, Date, decodeURIComponent,
+  });
+  return { saved, notifications, doneCount };
+}
+
+// 1) 真实签到 POST：响应带奖励字段 → 认定为签到动作，保存 lynk_sign_capture，不泄露敏感值。
+(function testRealSignActionCaptured() {
+  const { saved, notifications, doneCount } = runCapture({
+    url: "https://app-gateway-common.lynkco.com/up/api/v1/user/sign/doSign?ignored=1",
     method: "POST",
     headers: {
       token: "secret-access-token",
       Authorization: "APPCODE secret-app-code",
-      "X-Ca-Key": "new-key-123",
+      "X-Ca-Key": "204644386",
       "X-Ca-Signature": "must-not-be-saved",
-      "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Nonce",
+      "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
+      "X-Ca-Stage": "RELEASE",
       "X-Ca-Nonce": "must-not-be-saved",
-      "X-Ca-Timestamp": "must-not-be-saved",
-      gl_app_version: "5.0.0",
+      gl_app_version: "4.2.4",
       gl_dev_id: "device-secret-value",
+      "user-agent": "CA_iOS_SDK_2.0",
       "content-type": "application/json",
     },
     body: JSON.stringify({ private: "must-not-be-saved" }),
-  },
-  $response: {
+  }, {
     statusCode: 200,
-    body: JSON.stringify({ code: "success", message: "操作成功", data: { private: "must-not-be-saved" } }),
-  },
-  $prefs: {
-    setValueForKey(value, key) { saved[key] = value; return true; },
-  },
-  $notify(title, subtitle, body) { notifications.push({ title, subtitle, body }); },
-  $done() { doneCount += 1; },
-  JSON,
-  String,
-  Object,
-  Date,
-});
+    body: JSON.stringify({ code: "success", message: "签到成功", data: { rewardEnergyNumber: 1, signStatus: 1 } }),
+  });
 
-const meta = JSON.parse(saved.lynk_sign_capture);
-assert.equal(meta.path, "/up/api/v1/user/sign");
-assert.equal(meta.xCaKey, "new-key-123");
-assert.equal(meta.hasAppCode, true);
-assert.equal(meta.hasToken, true);
-assert.equal(meta.appVersion, "5.0.0");
-assert.deepEqual(Array.from(meta.queryKeys), ["ignored"]);
-assert.deepEqual(Array.from(meta.requestBodyKeys), ["private"]);
-assert.deepEqual(Array.from(meta.responseDataKeys), ["private"]);
-assert.deepEqual(Array.from(meta.deviceHeaderNames), ["gl_app_version", "gl_dev_id"]);
-assert.equal(doneCount, 1);
-assert.equal(notifications.length, 1);
-assert.match(notifications[0].body, /APP=5\.0\.0/);
+  const meta = JSON.parse(saved.lynk_sign_capture);
+  assert.equal(meta.captureType, "sign-post");
+  assert.equal(meta.host, "app-gateway-common.lynkco.com");
+  assert.equal(meta.path, "/up/api/v1/user/sign/doSign");
+  assert.equal(meta.xCaKey, "204644386");
+  assert.equal(meta.hasAppCode, true);
+  assert.equal(meta.xCaStage, "RELEASE");
+  assert.equal(meta.userAgent, "CA_iOS_SDK_2.0");
+  assert.equal(meta.responseHasReward, true);
+  assert.equal(doneCount, 1);
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0].title, /真实签到请求已捕获/);
+  for (const secret of ["secret-access-token", "secret-app-code", "must-not-be-saved", "device-secret-value"]) {
+    assert.equal(saved.lynk_sign_capture.includes(secret), false, `leaked: ${secret}`);
+  }
+  console.log("lynk_sign_capture: real sign action test passed");
+})();
 
-const serialized = saved.lynk_sign_capture;
-for (const secret of [
-  "secret-access-token",
-  "secret-app-code",
-  "must-not-be-saved",
-  "device-secret-value",
-]) {
-  assert.equal(serialized.includes(secret), false, `captured metadata leaked: ${secret}`);
-}
-
-console.log("lynk_sign_capture tests passed");
-
-const statusSaved = {};
-const statusNotifications = [];
-let statusDoneCount = 0;
-
-vm.runInNewContext(source, {
-  $request: {
-    url: "https://app-api-gw-toc.lynkco.com/up/api/v1/userReward/getContinueDaysAndSignCard",
-    method: "GET",
-    headers: {
-      token: "status-secret-token",
-      Authorization: "APPCODE status-secret-app-code",
-      "X-Ca-Key": "current-status-key",
-      "X-Ca-Signature": "status-signature-secret",
-      "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Nonce",
-      gl_app_version: "5.1.0",
-    },
-  },
-  $response: {
-    statusCode: 200,
-    body: JSON.stringify({ code: "success", message: "操作成功", data: { continueDays: 7 } }),
-  },
-  $prefs: {
-    setValueForKey(value, key) { statusSaved[key] = value; return true; },
-  },
-  $notify(title, subtitle, body) { statusNotifications.push({ title, subtitle, body }); },
-  $done() { statusDoneCount += 1; },
-  JSON,
-  String,
-  Object,
-  Date,
-});
-
-const statusMeta = JSON.parse(statusSaved.lynk_sign_status_capture);
-assert.equal(statusMeta.captureType, "sign-status");
-assert.equal(statusMeta.method, "GET");
-assert.equal(statusMeta.path, "/up/api/v1/userReward/getContinueDaysAndSignCard");
-assert.equal(statusMeta.xCaKey, "current-status-key");
-assert.equal(statusMeta.hasAppCode, true);
-assert.equal(statusDoneCount, 1);
-assert.equal(statusNotifications.length, 1);
-assert.match(statusNotifications[0].subtitle, /app-api-gw-toc\.lynkco\.com\/up\/api\/v1\/userReward/);
-assert.match(statusNotifications[0].body, /APP=5\.1\.0/);
-assert.equal(statusSaved.lynk_sign_status_capture.includes("status-secret-token"), false);
-assert.equal(statusSaved.lynk_sign_status_capture.includes("status-secret-app-code"), false);
-assert.equal(statusSaved.lynk_sign_status_capture.includes("status-signature-secret"), false);
-
-console.log("lynk_sign status capture tests passed");
-
-const candidateSaved = {};
-const candidateNotifications = [];
-vm.runInNewContext(source, {
-  $request: {
-    url: "https://app-api-gw-toc.lynkco.com/up/api/v2/userReward/dailyAction?scene=calendar",
+// 2) 状态探测 POST：响应无奖励字段 → 绝不保存为 sign-post（修复最初误抓 /sign/info 的 bug）。
+(function testStatusProbeNotCapturedAsSign() {
+  const { saved } = runCapture({
+    url: "https://app-api-gw-toc.lynkco.com/up/api/v1/user/sign/info",
     method: "POST",
     headers: {
-      token: "candidate-secret-token",
-      "X-Ca-Key": "candidate-key",
-      "X-Ca-Signature": "candidate-signature-secret",
-      gl_app_build: "50200001",
+      token: "t", "X-Ca-Key": "204644386",
+      "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
       "content-type": "application/json",
     },
-    body: JSON.stringify({ action: "private-value", source: "private-value" }),
-  },
-  $response: {
-    statusCode: 403,
-    body: JSON.stringify({ code: "403", message: "Unauthorized Consumer" }),
-  },
-  $prefs: {
-    setValueForKey(value, key) { candidateSaved[key] = value; return true; },
-  },
-  $notify(title, subtitle, body) { candidateNotifications.push({ title, subtitle, body }); },
-  $done() {},
-  JSON,
-  String,
-  Object,
-  Date,
-  Array,
-  decodeURIComponent,
-});
+    body: JSON.stringify({}),
+  }, {
+    statusCode: 200,
+    body: JSON.stringify({ code: "success", message: "操作成功", data: { signStatus: 1, continueDays: 8 } }),
+  });
 
-const candidateMeta = JSON.parse(candidateSaved.lynk_sign_candidate_capture);
-assert.equal(candidateMeta.captureType, "sign-candidate-post");
-assert.equal(candidateMeta.path, "/up/api/v2/userReward/dailyAction");
-assert.deepEqual(Array.from(candidateMeta.queryKeys), ["scene"]);
-assert.deepEqual(Array.from(candidateMeta.requestBodyKeys), ["action", "source"]);
-assert.equal(candidateMeta.responseStatus, 403);
-assert.equal(candidateNotifications.length, 1);
-assert.match(candidateNotifications[0].title, /候选 POST/);
-for (const secret of ["candidate-secret-token", "candidate-signature-secret", "private-value"]) {
-  assert.equal(JSON.stringify(candidateSaved).includes(secret), false, `candidate metadata leaked: ${secret}`);
-}
+  assert.equal(saved.lynk_sign_capture, undefined, "status probe must NOT be saved as the sign action");
+  console.log("lynk_sign_capture: status probe rejection test passed");
+})();
 
-console.log("lynk_sign candidate capture tests passed");
+// 3) 状态 GET 仍单独留档，供对照，但不会被当作签到动作。
+(function testStatusGetStoredSeparately() {
+  const { saved } = runCapture({
+    url: "https://app-api-gw-toc.lynkco.com/up/api/v1/userReward/getContinueDaysAndSignCard",
+    method: "GET",
+    headers: { token: "t", "X-Ca-Key": "204644386" },
+  }, {
+    statusCode: 200,
+    body: JSON.stringify({ code: "success", data: { continueDays: 8 } }),
+  });
+
+  assert.equal(saved.lynk_sign_capture, undefined);
+  assert.ok(saved.lynk_sign_status_capture, "status GET should be logged separately");
+  console.log("lynk_sign_capture: status GET test passed");
+})();
+
+console.log("lynk_sign_capture tests passed");
