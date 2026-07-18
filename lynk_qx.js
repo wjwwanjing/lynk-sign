@@ -321,10 +321,11 @@ function hmacSign(method, path, params, caKey, caSecret, signatureOptions) {
   // X-Ca-Signature-Headers 可因 APP 模块不同而增减。签名串必须使用捕获到的
   // 名称、集合和对应值，不能继续固定为旧版四项。
   var signedNames = signatureHeaders.split(",").map(function (name) { return name.trim(); }).filter(Boolean);
-  signedNames.sort(function (a, b) {
-    a = a.toLowerCase(); b = b.toLowerCase();
-    return a < b ? -1 : (a > b ? 1 : 0);
-  });
+  // 真实 APP profile 的列表就是其 SDK 生成签名时使用的顺序，必须原样保留。
+  // 非 profile 请求继续沿用旧版已验证的默认顺序，避免影响其它业务接口。
+  if (!signatureOptions.preserveSignatureHeaderOrder) {
+    signedNames = ["X-Ca-Key", "X-Ca-Nonce", "X-Ca-Signature-Method", "X-Ca-Timestamp"];
+  }
   var canonicalHeaders = signedNames.map(function (name) {
     var value = signedValues[name.toLowerCase()];
     if (value == null) throw new Error("无法重建签名头: " + name);
@@ -624,6 +625,7 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
       accept: profile.accept,
       contentType: profile.contentType,
       signatureHeaders: profile.signatureHeaders,
+      preserveSignatureHeaderOrder: true,
       signedHeaderValues: requestHeaders,
     };
   }
