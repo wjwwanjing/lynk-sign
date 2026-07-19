@@ -205,7 +205,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 - **businessNo** 来源：优先从社区信息流 `square/index2` 取第一篇真实文章 ID；取不到才回退到配置的 `lynk_share_cid`。用真实文章而非固定 ID，更贴近官方 APP 行为。
 - **shareReporting 不带 token，但不能省略 APPCODE**：`xbgo/lynkco-daily` 的请求构造器即使在 `token_required=False` 时仍保留 `Authorization: APPCODE ...`。旧 QX 版把这两个头一起删掉，是点击回调不能正常记账的主要问题。
 - **签到请求**：4.2.4 真机确认的动作是 `POST app-api-gw-toc.lynkco.com/up/api/v1/user/sign/upgrade`，使用 `X-Ca-Key=203760416`、`token` 和 `X-Ca-*` 签名，不带 APPCODE。旧 `/up/api/v1/user/sign + 204644386` 会返回 `403 Unauthorized Consumer`，脚本已不再使用该组合；旧的 `lynk_sign_path=/up/api/v1/user/sign` 偏好值也会自动迁移。
-- **签到捕获与动态签名**：`lynk_sign_capture.js` 只把「响应带签到奖励字段（`rewardEnergyNumber` 等）或明确签到成功文案」的 POST 认定为真实签到动作，状态探测不会被误抓。脚本会采用捕获到的 host/path/Key/APPCODE 状态，并按实际 `X-Ca-Signature-Headers` 动态生成 HMAC，支持 `X-Ca-Stage`、Token、APP 和设备头；未知签名头、CEP 或缺失正文值时仍拒绝盲目回放并输出具体原因。
+- **签到捕获与动态签名**：`lynk_sign_capture.js` 只把「响应带签到奖励字段（`rewardEnergyNumber` 等）或明确签到成功文案」的 POST 认定为真实签到动作，状态探测不会被误抓。脚本会采用捕获到的 host/path/Key/APPCODE 状态，并按实际 `X-Ca-Signature-Headers` 动态生成 HMAC，支持 `X-Ca-Stage`、Token、APP、设备头及标准 `Content-MD5` / `Date` 字段；旧捕获缺少 MD5 时，仅在明确返回 `Invalid Signature` 后追加一次 `{}` 的标准 Base64-MD5 重试。
 - **重试机制**：若 `getShareCode` 返回风控拦截（`share.need.validate.check`），等 3 秒重试 1 次（风控有短窗口限流）
 - **文章与分享码保持一致**：社区文章、风险头里的 H5 URL、`businessNo`、最终通知链接使用同一个文章 ID；不会再出现“最新文章取码、固定文章上报”的混用。
 - **成功判定**：接口成功只代表“上报已受理”。分享奖励是“能量体”，脚本会比较主账号 `/app/energy/my/growth` 中 `accountLevelVo.growth` 的前后差值；`/app/energy/myEnergy.data.point` 是 Co积分，不再用于核验分享奖励。

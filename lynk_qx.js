@@ -81,6 +81,8 @@ const CA_SECRET  = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 // 4.2.4 真机签到 POST /user/sign/upgrade 使用的生产 Consumer。
 const SIGN_CA_KEY = "203760416";
 const SIGN_CA_SECRET = "IbyhE02AwkUzvupDon3xTZ3JIeddlppP";
+// Base64(MD5("{}"))；签到请求正文固定为 {}，仅在网关返回 Invalid Signature 时诊断重试。
+const EMPTY_JSON_MD5_BASE64 = "mZFLkyvTelC5g8XnyQrpOw==";
 const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method";
 const APP_VERSION      = "4.2.4";   // APP 版本号（与 doRefresh 一致）
@@ -292,6 +294,8 @@ function hmacSign(method, path, params, caKey, caSecret, signatureOptions) {
   signatureOptions = signatureOptions || {};
   var accept = signatureOptions.accept || "*/*";
   var contentType = signatureOptions.contentType || "application/json";
+  var contentMd5 = String(signatureOptions.contentMd5 || "");
+  var dateHeader = String(signatureOptions.dateHeader || "");
   var signatureHeaders = String(signatureOptions.signatureHeaders || SIG_HDRS);
   var t = ts();
   var n = nonce();
@@ -335,9 +339,9 @@ function hmacSign(method, path, params, caKey, caSecret, signatureOptions) {
   var parts = [
     method.toUpperCase(),
     accept,
-    "",
+    contentMd5,
     contentType,
-    "",
+    dateHeader,
   ].concat(canonicalHeaders).concat([url]);
   var strToSign = parts.join("\n");
   var sig = hmacSha256Base64(caSecret, strToSign);
@@ -351,6 +355,8 @@ function hmacSign(method, path, params, caKey, caSecret, signatureOptions) {
     "X-Ca-Signature": sig,
     "Accept": accept,
   };
+  if (contentMd5) result["Content-MD5"] = contentMd5;
+  if (dateHeader) result.Date = dateHeader;
   return result;
 }
 
@@ -584,6 +590,8 @@ function capturedSignProfile() {
       xCaStage: String(m.xCaStage || (signatureHeaderNames(m.signatureHeaders).indexOf("x-ca-stage") >= 0 ? "RELEASE" : "")),
       contentType: String(m.contentType || "application/json"),
       accept: String(m.accept || "*/*"),
+      contentMd5: String(m.contentMd5 || ""),
+      hasDateHeader: !!m.hasDateHeader,
       publicPlatform: String(m.publicPlatform || "iOS"),
       appVersion: String(m.appVersion || APP_VERSION),
       appBuild: String(m.appBuild || APP_VERSION_CODE),
@@ -614,6 +622,8 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
     if (profile.useSecurity) requestHeaders.use_security = "true";
     if (profile.hasRiskType) requestHeaders.risk_type = "1";
     if (profile.xCaVersion) requestHeaders["x-ca-version"] = profile.xCaVersion;
+    if (profile.contentMd5) requestHeaders["Content-MD5"] = profile.contentMd5;
+    if (profile.hasDateHeader) requestHeaders.Date = new Date().toUTCString();
     if (profile.userAgent) requestHeaders["user-agent"] = profile.userAgent;
     profile.deviceHeaderNames.forEach(function (name) {
       var lower = String(name).toLowerCase();
@@ -624,6 +634,8 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
     signatureOptions = {
       accept: profile.accept,
       contentType: profile.contentType,
+      contentMd5: profile.contentMd5,
+      dateHeader: requestHeaders.Date || "",
       signatureHeaders: profile.signatureHeaders,
       preserveSignatureHeaderOrder: true,
       signedHeaderValues: requestHeaders,
@@ -821,6 +833,12 @@ function unauthorizedConsumer(resp) {
   if (!resp) return false;
   var text = String(resp.message || resp.msg || "") + " " + String(resp.raw || "");
   return text.toLowerCase().indexOf("unauthorized consumer") >= 0;
+}
+
+function invalidSignature(resp) {
+  if (!resp) return false;
+  var text = String(resp.message || resp.msg || "") + " " + String(resp.raw || "");
+  return text.toLowerCase().indexOf("invalid signature") >= 0;
 }
 
 // 判定接口是否接受了上报；这不等价于奖励已经到账。
@@ -1049,6 +1067,10 @@ async function main() {
         " path=" + capProfile.path + " X-Ca-Key=" + capProfile.caKey +
         (capProfile.hasAppCode ? " +APPCODE" : "，不带 APPCODE") +
         "，签名头=" + capProfile.signatureHeaders);
+      log("签到签名元数据: Accept=" + capProfile.accept + " Content-Type=" + capProfile.contentType +
+        " X-Ca-Version=" + (capProfile.xCaVersion || "无") +
+        " Content-MD5=" + (capProfile.contentMd5 ? "有" : "无") +
+        " Date=" + (capProfile.hasDateHeader ? "有" : "无"));
     } else {
       if (capProfile && !capProfile.supported) {
         log("签到: 捕获配置未采用（" + capProfile.unsupportedReason + "），回退默认端点");
@@ -1057,6 +1079,14 @@ async function main() {
       log("签到: POST " + signPath() + "，X-Ca-Key=" + SIGN_CA_KEY + " + token，不带 APPCODE");
     }
     var sr = await apiPostSign(token, {}, null, null, capProfile);
+    // CAClient 可能为 JSON POST 自动加入 Content-MD5；旧捕获未记录该标准头。
+    // 只在明确 Invalid Signature 时用 {} 的标准 Base64-MD5 诊断重试一次。
+    if (capProfile && invalidSignature(sr) && !capProfile.contentMd5) {
+      log("签到: 签名被拒绝，追加 Content-MD5 后重试一次");
+      var md5Profile = Object.assign({}, capProfile, { contentMd5: EMPTY_JSON_MD5_BASE64 });
+      sr = await apiPostSign(token, {}, null, null, md5Profile);
+      log("签到 Content-MD5 重试: " + safeResponseSummary(sr));
+    }
     if (isOk(sr)) {
       signResult = "签到成功";
       rememberSignedToday();
