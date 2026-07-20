@@ -82,6 +82,7 @@ const CA_SECRET  = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 const SIGN_CA_KEY = "203760416";
 const SIGN_CA_SECRET = "IbyhE02AwkUzvupDon3xTZ3JIeddlppP";
 // Base64(MD5("{}"))；签到请求正文固定为 {}，仅在网关返回 Invalid Signature 时诊断重试。
+const EMPTY_BODY_MD5_BASE64 = "1B2M2Y8AsgTpgAmY7PhCfg==";
 const EMPTY_JSON_MD5_BASE64 = "mZFLkyvTelC5g8XnyQrpOw==";
 const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method";
@@ -393,8 +394,14 @@ function httpGet(url, headers) {
 }
 
 function httpPost(url, headers, body) {
+  return httpPostRaw(url, headers, JSON.stringify(body || {}));
+}
+
+function httpPostRaw(url, headers, bodyText) {
   return new Promise(function (resolve) {
-    $task.fetch({ url: url, method: "POST", headers: headers || {}, body: JSON.stringify(body || {}) })
+    var req = { url: url, method: "POST", headers: headers || {} };
+    if (bodyText !== null && bodyText !== undefined) req.body = String(bodyText);
+    $task.fetch(req)
       .then(function (resp) {
         try {
           var parsed = JSON.parse(resp.body);
@@ -553,6 +560,86 @@ function unsupportedSignatureHeaders(value) {
   return signatureHeaderNames(value).filter(function (name) { return !supported[name]; });
 }
 
+function lowerSignatureHeaders(value) {
+  return String(value || SIG_HDRS).split(",").map(function (name) {
+    return name.trim().toLowerCase();
+  }).filter(Boolean).join(",");
+}
+
+function normalizedContentType(value) {
+  var v = String(value || "").toLowerCase();
+  return v.indexOf("application/json") >= 0 && v !== "application/json" ? "application/json" : "";
+}
+
+function signBodyText(profile, body) {
+  if (profile && profile.requestBodyLength === 0) return "";
+  return JSON.stringify(body || {});
+}
+
+function signBodyMd5(profile) {
+  return signBodyText(profile, {}).length === 0 ? EMPTY_BODY_MD5_BASE64 : EMPTY_JSON_MD5_BASE64;
+}
+
+function signRetryProfiles(profile) {
+  if (!profile) return [];
+  var variants = [];
+  function add(label, patch) {
+    var next = Object.assign({}, profile, patch || {});
+    next.retryLabel = label;
+    var key = [
+      next.contentMd5 || "",
+      next.signatureHeaders || "",
+      next.contentType || "",
+      next.requestBodyLength == null ? "" : String(next.requestBodyLength),
+    ].join("|");
+    for (var i = 0; i < variants.length; i++) {
+      var old = variants[i];
+      var oldKey = [
+        old.contentMd5 || "",
+        old.signatureHeaders || "",
+        old.contentType || "",
+        old.requestBodyLength == null ? "" : String(old.requestBodyLength),
+      ].join("|");
+      if (oldKey === key) return;
+    }
+    variants.push(next);
+  }
+  var md5 = signBodyMd5(profile);
+  var lowerHeaders = lowerSignatureHeaders(profile.signatureHeaders);
+  var compactType = normalizedContentType(profile.contentType);
+  if (!profile.contentMd5) add("Content-MD5(" + (signBodyText(profile, {}).length === 0 ? "empty" : "{}") + ")", { contentMd5: md5 });
+  if (lowerHeaders && lowerHeaders !== profile.signatureHeaders) {
+    add("lowercase X-Ca-Signature-Headers", { signatureHeaders: lowerHeaders });
+    if (!profile.contentMd5) add("lowercase headers + Content-MD5", { signatureHeaders: lowerHeaders, contentMd5: md5 });
+  }
+  if (compactType) {
+    add("Content-Type=application/json", { contentType: compactType });
+    if (!profile.contentMd5) add("Content-Type=application/json + Content-MD5", { contentType: compactType, contentMd5: md5 });
+  }
+  return variants.slice(0, 5);
+}
+
+function nativeSdkSignProfile() {
+  return {
+    baseUrl: API_BASE,
+    path: DEFAULT_SIGN_PATH,
+    caKey: SIGN_CA_KEY,
+    caSecret: SIGN_CA_SECRET,
+    signatureHeaders: "x-ca-nonce,x-ca-key,x-ca-timestamp",
+    hasAppCode: false,
+    contentType: "application/json; charset=utf-8",
+    accept: "application/json; charset=utf-8",
+    contentMd5: EMPTY_JSON_MD5_BASE64,
+    hasDateHeader: true,
+    requestBodyLength: null,
+    publicPlatform: "",
+    userAgent: "ALIYUN-ANDROID-UA",
+    deviceHeaderNames: [],
+    nativeCaVersion: true,
+    xRequireToken: "false",
+  };
+}
+
 // 读取 lynk_sign_capture.js 精确捕获的真实签到 POST。
 // 只有响应确认带奖励字段(responseHasReward)、Key 密钥已知、签名头值可复现时才自动采用。
 function capturedSignProfile() {
@@ -592,6 +679,7 @@ function capturedSignProfile() {
       accept: String(m.accept || "*/*"),
       contentMd5: String(m.contentMd5 || ""),
       hasDateHeader: !!m.hasDateHeader,
+      requestBodyLength: m.requestBodyLength == null ? null : Number(m.requestBodyLength || 0),
       publicPlatform: String(m.publicPlatform || "iOS"),
       appVersion: String(m.appVersion || APP_VERSION),
       appBuild: String(m.appBuild || APP_VERSION_CODE),
@@ -617,13 +705,15 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
     if (!key) { key = profile.caKey; secret = profile.caSecret; }
     withAppCode = profile.hasAppCode;
     requestHeaders["content-type"] = profile.contentType;
-    requestHeaders.publicplatform = profile.publicPlatform;
+    if (profile.publicPlatform) requestHeaders.publicplatform = profile.publicPlatform;
     if (profile.xCaStage) requestHeaders["x-ca-stage"] = profile.xCaStage;
     if (profile.useSecurity) requestHeaders.use_security = "true";
     if (profile.hasRiskType) requestHeaders.risk_type = "1";
     if (profile.xCaVersion) requestHeaders["x-ca-version"] = profile.xCaVersion;
     if (profile.contentMd5) requestHeaders["Content-MD5"] = profile.contentMd5;
     if (profile.hasDateHeader) requestHeaders.Date = new Date().toUTCString();
+    if (profile.nativeCaVersion) requestHeaders.ca_version = "1";
+    if (profile.xRequireToken != null) requestHeaders["x-requiretoken"] = String(profile.xRequireToken);
     if (profile.userAgent) requestHeaders["user-agent"] = profile.userAgent;
     profile.deviceHeaderNames.forEach(function (name) {
       var lower = String(name).toLowerCase();
@@ -646,7 +736,7 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
   signatureOptions.signedHeaderValues = requestHeaders;
   var sig = hmacSign("POST", path, null, key, secret, signatureOptions);
   var headers = Object.assign({}, requestHeaders, sig);
-  return httpPost(base + path, headers, body || {});
+  return httpPostRaw(base + path, headers, signBodyText(profile, body || {}));
 }
 
 // 不带 token，但仍带 APPCODE（与 H5 页面和 xbgo 参考实现一致）。
@@ -1070,7 +1160,8 @@ async function main() {
       log("签到签名元数据: Accept=" + capProfile.accept + " Content-Type=" + capProfile.contentType +
         " X-Ca-Version=" + (capProfile.xCaVersion || "无") +
         " Content-MD5=" + (capProfile.contentMd5 ? "有" : "无") +
-        " Date=" + (capProfile.hasDateHeader ? "有" : "无"));
+        " Date=" + (capProfile.hasDateHeader ? "有" : "无") +
+        " BodyLen=" + (capProfile.requestBodyLength == null ? "未知" : String(capProfile.requestBodyLength)));
     } else {
       if (capProfile && !capProfile.supported) {
         log("签到: 捕获配置未采用（" + capProfile.unsupportedReason + "），回退默认端点");
@@ -1078,14 +1169,25 @@ async function main() {
       capProfile = null;
       log("签到: POST " + signPath() + "，X-Ca-Key=" + SIGN_CA_KEY + " + token，不带 APPCODE");
     }
-    var sr = await apiPostSign(token, {}, null, null, capProfile);
-    // CAClient 可能为 JSON POST 自动加入 Content-MD5；旧捕获未记录该标准头。
-    // 只在明确 Invalid Signature 时用 {} 的标准 Base64-MD5 诊断重试一次。
-    if (capProfile && invalidSignature(sr) && !capProfile.contentMd5) {
-      log("签到: 签名被拒绝，追加 Content-MD5 后重试一次");
-      var md5Profile = Object.assign({}, capProfile, { contentMd5: EMPTY_JSON_MD5_BASE64 });
-      sr = await apiPostSign(token, {}, null, null, md5Profile);
-      log("签到 Content-MD5 重试: " + safeResponseSummary(sr));
+    var signBody = {};
+    var sr = await apiPostSign(token, signBody, null, null, capProfile);
+    if (capProfile && invalidSignature(sr)) {
+      var retryProfiles = signRetryProfiles(capProfile);
+      if (retryProfiles.length > 0) {
+        log("签到: 签名被拒绝，开始变体重试 " + retryProfiles.length + " 次");
+        for (var rp = 0; rp < retryProfiles.length; rp++) {
+          var retryProfile = retryProfiles[rp];
+          log("签到重试[" + (rp + 1) + "/" + retryProfiles.length + "]: " + retryProfile.retryLabel);
+          sr = await apiPostSign(token, signBody, null, null, retryProfile);
+          log("签到重试结果: " + safeResponseSummary(sr));
+          if (!invalidSignature(sr)) break;
+        }
+      }
+    }
+    if (invalidSignature(sr)) {
+      log("签到: 捕获签名仍被拒绝，尝试 LynkCoHelper 原生 SDK 签名兜底");
+      sr = await apiPostSign(token, signBody, null, null, nativeSdkSignProfile());
+      log("签到原生 SDK 兜底结果: " + safeResponseSummary(sr));
     }
     if (isOk(sr)) {
       signResult = "签到成功";

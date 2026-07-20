@@ -360,7 +360,7 @@ async function testCapturedRewardSignProfileIsReplayed() {
     host: "app-api-gw-toc.lynkco.com",
     path: "/up/api/v1/user/sign/upgrade",
     xCaKey: "203760416",
-    signatureHeaders: "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Stage",
+    signatureHeaders: "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp,X-Ca-Version,token",
     hasAppCode: false,
     hasCepAuthentication: false,
     useSecurity: true,
@@ -395,16 +395,22 @@ async function testCapturedRewardSignProfileIsReplayed() {
       assert.equal(request.headers.token, "main-access");
       assert.equal(request.headers.use_security, "true");
       assert.equal(request.headers["x-ca-version"], "1");
-      assert.equal(request.headers["x-ca-stage"], "RELEASE");
       assert.equal(request.headers["X-Ca-Signature-Headers"], captured.signatureHeaders);
       assert.equal(request.headers.gl_dev_id, "main-device");
       assert.equal(request.headers.gl_app_version, "4.2.4");
+      if (signPosts === 1) {
+        assert.equal(request.headers["Content-MD5"], undefined);
+        return { code: "400", message: "Invalid Signature" };
+      }
+      assert.equal(request.headers["Content-MD5"], "mZFLkyvTelC5g8XnyQrpOw==");
       const stringToSign = [
-        "POST", "*/*", "", "application/json", "",
+        "POST", "*/*", "mZFLkyvTelC5g8XnyQrpOw==", "application/json", "",
         `X-Ca-Key:${request.headers["X-Ca-Key"]}`,
         `X-Ca-Nonce:${request.headers["X-Ca-Nonce"]}`,
-        "X-Ca-Stage:RELEASE",
+        "X-Ca-Signature-Method:HmacSHA256",
         `X-Ca-Timestamp:${request.headers["X-Ca-Timestamp"]}`,
+        "X-Ca-Version:1",
+        "token:main-access",
         "/up/api/v1/user/sign/upgrade",
       ].join("\n");
       const expectedSignature = crypto.createHmac("sha256", "IbyhE02AwkUzvupDon3xTZ3JIeddlppP")
@@ -420,7 +426,125 @@ async function testCapturedRewardSignProfileIsReplayed() {
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
 
-  assert.equal(signPosts, 1);
+  assert.equal(signPosts, 2, "Invalid Signature must trigger one Content-MD5 retry");
+  assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
+}
+
+async function testCapturedEmptyBodySignUsesEmptyMd5Retry() {
+  const captured = {
+    captureType: "sign-post",
+    method: "POST",
+    host: "app-api-gw-toc.lynkco.com",
+    path: "/up/api/v1/user/sign/upgrade",
+    xCaKey: "203760416",
+    signatureHeaders: "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp,X-Ca-Version,token",
+    hasAppCode: false,
+    hasCepAuthentication: false,
+    xCaVersion: "1",
+    contentType: "application/json; charset=UTF-8",
+    accept: "application/json",
+    requestBodyLength: 0,
+    responseHasReward: true,
+  };
+  let signPosts = 0;
+  const result = await runQx({
+    lynk_refresh_token: "main-refresh",
+    lynk_device_id: "main-device",
+    lynk_self_share: "0",
+    lynk_share_delay: "0",
+    lynk_sign_capture: JSON.stringify(captured),
+  }, async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/auth/login/refresh")) {
+      return { code: "success", data: { centerTokenDto: { token: "main-access" } } };
+    }
+    if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
+    if (url.pathname === "/up/api/v1/user/sign/upgrade") {
+      signPosts += 1;
+      assert.equal(request.body, "", "captured empty sign body must be replayed as empty");
+      if (signPosts === 1) {
+        assert.equal(request.headers["Content-MD5"], undefined);
+        return { code: "400", message: "Invalid Signature" };
+      }
+      assert.equal(request.headers["Content-MD5"], "1B2M2Y8AsgTpgAmY7PhCfg==");
+      return { code: "success", data: { rewardEnergyNumber: 1 } };
+    }
+    if (url.pathname === "/app/energy/myEnergy") return { code: "success", data: { point: 822, incomePoint: 1022 } };
+    if (url.pathname === "/app/energy/my/growth") return { code: "success", data: {} };
+    if (url.pathname.endsWith("getTaskList")) return { code: "success", data: [] };
+    if (url.pathname.endsWith("square/index2")) return { code: "success", data: [{ articleId: "article-empty-body" }] };
+    if (url.pathname.endsWith("getShareCode")) return { code: "success", data: "code-empty-body" };
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+
+  assert.equal(signPosts, 2, "empty body Invalid Signature must trigger one empty-body MD5 retry");
+  assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
+}
+
+async function testNativeSdkFallbackAfterCapturedInvalidSignature() {
+  const captured = {
+    captureType: "sign-post",
+    method: "POST",
+    host: "app-api-gw-toc.lynkco.com",
+    path: "/up/api/v1/user/sign/upgrade",
+    xCaKey: "203760416",
+    signatureHeaders: "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp,X-Ca-Version,token",
+    hasAppCode: false,
+    hasCepAuthentication: false,
+    xCaVersion: "1",
+    contentType: "application/json; charset=UTF-8",
+    accept: "application/json",
+    requestBodyLength: null,
+    responseHasReward: true,
+  };
+  let signPosts = 0;
+  const result = await runQx({
+    lynk_refresh_token: "main-refresh",
+    lynk_device_id: "main-device",
+    lynk_self_share: "0",
+    lynk_share_delay: "0",
+    lynk_sign_capture: JSON.stringify(captured),
+  }, async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/auth/login/refresh")) {
+      return { code: "success", data: { centerTokenDto: { token: "main-access" } } };
+    }
+    if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
+    if (url.pathname === "/up/api/v1/user/sign/upgrade") {
+      signPosts += 1;
+      if (request.headers["X-Ca-Signature-Headers"] !== "x-ca-nonce,x-ca-key,x-ca-timestamp") {
+        return { code: "400", message: "Invalid Signature" };
+      }
+      assert.equal(request.body, "{}");
+      assert.equal(request.headers["Content-MD5"], "mZFLkyvTelC5g8XnyQrpOw==");
+      assert.ok(request.headers.Date, "native SDK fallback must include Date");
+      assert.equal(request.headers.ca_version, "1");
+      assert.equal(request.headers["x-requiretoken"], "false");
+      assert.equal(request.headers["user-agent"], "ALIYUN-ANDROID-UA");
+      assert.equal(request.headers["X-Ca-Signature-Headers"], "x-ca-nonce,x-ca-key,x-ca-timestamp");
+      assert.equal(request.headers["x-ca-version"], undefined);
+      const stringToSign = [
+        "POST", "application/json; charset=utf-8", "mZFLkyvTelC5g8XnyQrpOw==",
+        "application/json; charset=utf-8", request.headers.Date,
+        `x-ca-nonce:${request.headers["X-Ca-Nonce"]}`,
+        `x-ca-key:${request.headers["X-Ca-Key"]}`,
+        `x-ca-timestamp:${request.headers["X-Ca-Timestamp"]}`,
+        "/up/api/v1/user/sign/upgrade",
+      ].join("\n");
+      const expectedSignature = crypto.createHmac("sha256", "IbyhE02AwkUzvupDon3xTZ3JIeddlppP")
+        .update(stringToSign).digest("base64");
+      assert.equal(request.headers["X-Ca-Signature"], expectedSignature);
+      return { code: "success", data: { rewardEnergyNumber: 1 } };
+    }
+    if (url.pathname === "/app/energy/myEnergy") return { code: "success", data: { point: 823, incomePoint: 1023 } };
+    if (url.pathname === "/app/energy/my/growth") return { code: "success", data: {} };
+    if (url.pathname.endsWith("getTaskList")) return { code: "success", data: [] };
+    if (url.pathname.endsWith("square/index2")) return { code: "success", data: [{ articleId: "article-native-fallback" }] };
+    if (url.pathname.endsWith("getShareCode")) return { code: "success", data: "code-native-fallback" };
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+
+  assert.ok(signPosts >= 2, "captured Invalid Signature path must reach native SDK fallback");
   assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
 }
 
@@ -536,6 +660,8 @@ async function testDayInfoSkipsDuplicateSignPost() {
   await testSignSupportsPathOverride();
   await testLegacySignPathPreferenceIsMigrated();
   await testCapturedRewardSignProfileIsReplayed();
+  await testCapturedEmptyBodySignUsesEmptyMd5Retry();
+  await testNativeSdkFallbackAfterCapturedInvalidSignature();
   await testCapturedNonRewardPostIsIgnored();
   await testLocalSignDateSkipsDuplicatePost();
   await testDayInfoSkipsDuplicateSignPost();

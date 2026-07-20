@@ -32,6 +32,7 @@ function runCapture(request, response) {
       "X-Ca-Signature": "must-not-be-saved",
       "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
       "X-Ca-Stage": "RELEASE",
+      "Content-MD5": "mZFLkyvTelC5g8XnyQrpOw==",
       "X-Ca-Nonce": "must-not-be-saved",
       gl_app_version: "4.2.4",
       gl_dev_id: "device-secret-value",
@@ -51,6 +52,8 @@ function runCapture(request, response) {
   assert.equal(meta.xCaKey, "204644386");
   assert.equal(meta.hasAppCode, true);
   assert.equal(meta.xCaStage, "RELEASE");
+  assert.equal(meta.contentMd5, "mZFLkyvTelC5g8XnyQrpOw==");
+  assert.equal(meta.hasDateHeader, false);
   assert.equal(meta.userAgent, "CA_iOS_SDK_2.0");
   assert.equal(meta.responseHasReward, true);
   assert.equal(doneCount, 1);
