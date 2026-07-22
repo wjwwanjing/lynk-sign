@@ -640,6 +640,39 @@ function nativeSdkSignProfile() {
   };
 }
 
+function nativeSdkSignHeaders(method, path, bodyText) {
+  var accept = "application/json; charset=utf-8";
+  var contentType = "application/json; charset=utf-8";
+  var contentMd5 = bodyText ? EMPTY_JSON_MD5_BASE64 : "";
+  var dateHeader = new Date().toUTCString();
+  var n = nonce().toLowerCase();
+  var t = ts();
+  var canonicalHeaders = [
+    "x-ca-key:" + SIGN_CA_KEY,
+    "x-ca-nonce:" + n,
+    "x-ca-timestamp:" + t,
+  ];
+  var stringToSign = [
+    method.toUpperCase(),
+    accept,
+    contentMd5,
+    contentType,
+    dateHeader,
+  ].concat(canonicalHeaders).concat([path]).join("\n");
+  var sig = hmacSha256Base64(SIGN_CA_SECRET, stringToSign);
+  return {
+    "x-ca-key": SIGN_CA_KEY,
+    "x-ca-nonce": n,
+    "x-ca-timestamp": t,
+    "x-ca-signature-headers": "x-ca-nonce,x-ca-key,x-ca-timestamp",
+    "x-ca-signature": sig,
+    "date": dateHeader,
+    "accept": accept,
+    "content-type": contentType,
+    "content-md5": contentMd5,
+  };
+}
+
 // 读取 lynk_sign_capture.js 精确捕获的真实签到 POST。
 // 只有响应确认带奖励字段(responseHasReward)、Key 密钥已知、签名头值可复现时才自动采用。
 function capturedSignProfile() {
@@ -737,6 +770,17 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
   var sig = hmacSign("POST", path, null, key, secret, signatureOptions);
   var headers = Object.assign({}, requestHeaders, sig);
   return httpPostRaw(base + path, headers, signBodyText(profile, body || {}));
+}
+
+function apiPostSignNativeSdk(token) {
+  var bodyText = "{}";
+  var headers = Object.assign({}, nativeSdkSignHeaders("POST", DEFAULT_SIGN_PATH, bodyText), {
+    "token": token,
+    "ca_version": "1",
+    "x-requiretoken": "false",
+    "User-Agent": "ALIYUN-ANDROID-UA",
+  });
+  return httpPostRaw(API_BASE + DEFAULT_SIGN_PATH, headers, bodyText);
 }
 
 // 不带 token，但仍带 APPCODE（与 H5 页面和 xbgo 参考实现一致）。
@@ -1184,10 +1228,10 @@ async function main() {
         }
       }
     }
-    if (invalidSignature(sr)) {
-      log("签到: 捕获签名仍被拒绝，尝试 LynkCoHelper 原生 SDK 签名兜底");
-      sr = await apiPostSign(token, signBody, null, null, nativeSdkSignProfile());
-      log("签到原生 SDK 兜底结果: " + safeResponseSummary(sr));
+    if (invalidSignature(sr) || unauthorizedConsumer(sr)) {
+      log("签到: 当前签名被网关拒绝，尝试 LynkCoHelper 原生 SDK 签名");
+      sr = await apiPostSignNativeSdk(token);
+      log("签到原生 SDK 结果: " + safeResponseSummary(sr));
     }
     if (isOk(sr)) {
       signResult = "签到成功";
