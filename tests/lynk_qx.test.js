@@ -512,28 +512,29 @@ async function testNativeSdkFallbackAfterCapturedInvalidSignature() {
     if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
     if (url.pathname === "/up/api/v1/user/sign/upgrade") {
       signPosts += 1;
-      if (request.headers["X-Ca-Signature-Headers"] !== "x-ca-nonce,x-ca-key,x-ca-timestamp") {
+      if (request.headers["x-ca-signature-headers"] !== "x-ca-nonce,x-ca-key,x-ca-timestamp") {
         return { code: "400", message: "Invalid Signature" };
       }
+      if (request.body === "") return { code: "400", message: "Invalid Signature" };
       assert.equal(request.body, "{}");
-      assert.equal(request.headers["Content-MD5"], "mZFLkyvTelC5g8XnyQrpOw==");
-      assert.ok(request.headers.Date, "native SDK fallback must include Date");
+      assert.equal(request.headers["content-md5"], "mZFLkyvTelC5g8XnyQrpOw==");
+      assert.ok(request.headers.date, "native SDK fallback must include date");
       assert.equal(request.headers.ca_version, "1");
       assert.equal(request.headers["x-requiretoken"], "false");
-      assert.equal(request.headers["user-agent"], "ALIYUN-ANDROID-UA");
-      assert.equal(request.headers["X-Ca-Signature-Headers"], "x-ca-nonce,x-ca-key,x-ca-timestamp");
+      assert.equal(request.headers["User-Agent"], "ALIYUN-ANDROID-UA");
+      assert.equal(request.headers["x-ca-signature-headers"], "x-ca-nonce,x-ca-key,x-ca-timestamp");
       assert.equal(request.headers["x-ca-version"], undefined);
       const stringToSign = [
         "POST", "application/json; charset=utf-8", "mZFLkyvTelC5g8XnyQrpOw==",
-        "application/json; charset=utf-8", request.headers.Date,
-        `x-ca-nonce:${request.headers["X-Ca-Nonce"]}`,
-        `x-ca-key:${request.headers["X-Ca-Key"]}`,
-        `x-ca-timestamp:${request.headers["X-Ca-Timestamp"]}`,
+        "application/json; charset=utf-8", request.headers.date,
+        `x-ca-key:${request.headers["x-ca-key"]}`,
+        `x-ca-nonce:${request.headers["x-ca-nonce"]}`,
+        `x-ca-timestamp:${request.headers["x-ca-timestamp"]}`,
         "/up/api/v1/user/sign/upgrade",
       ].join("\n");
       const expectedSignature = crypto.createHmac("sha256", "IbyhE02AwkUzvupDon3xTZ3JIeddlppP")
         .update(stringToSign).digest("base64");
-      assert.equal(request.headers["X-Ca-Signature"], expectedSignature);
+      assert.equal(request.headers["x-ca-signature"], expectedSignature);
       return { code: "success", data: { rewardEnergyNumber: 1 } };
     }
     if (url.pathname === "/app/energy/myEnergy") return { code: "success", data: { point: 823, incomePoint: 1023 } };
@@ -545,6 +546,69 @@ async function testNativeSdkFallbackAfterCapturedInvalidSignature() {
   });
 
   assert.ok(signPosts >= 2, "captured Invalid Signature path must reach native SDK fallback");
+  assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
+}
+
+async function testCapturedDateUnsignedRetry() {
+  const captured = {
+    captureType: "sign-post",
+    method: "POST",
+    host: "app-api-gw-toc.lynkco.com",
+    path: "/up/api/v1/user/sign/upgrade",
+    xCaKey: "203760416",
+    signatureHeaders: "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp,X-Ca-Version,token",
+    hasAppCode: false,
+    hasCepAuthentication: false,
+    xCaVersion: "1",
+    contentType: "application/json; charset=UTF-8",
+    accept: "application/json",
+    hasDateHeader: true,
+    dateInSignature: false,
+    requestBodyLength: 0,
+    responseHasReward: true,
+  };
+  let signPosts = 0;
+  const result = await runQx({
+    lynk_refresh_token: "main-refresh",
+    lynk_device_id: "main-device",
+    lynk_self_share: "0",
+    lynk_share_delay: "0",
+    lynk_sign_capture: JSON.stringify(captured),
+  }, async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/auth/login/refresh")) {
+      return { code: "success", data: { centerTokenDto: { token: "main-access" } } };
+    }
+    if (url.pathname.endsWith("getContinueDaysAndSignCard")) return { code: "success", data: { continueDays: 6 } };
+    if (url.pathname === "/up/api/v1/user/sign/upgrade") {
+      signPosts += 1;
+      if (request.headers["Content-MD5"]) return { code: "400", message: "Invalid Signature" };
+      assert.ok(request.headers.Date, "Date header should still be sent");
+      const stringToSign = [
+        "POST", "application/json", "",
+        "application/json; charset=UTF-8", "",
+        `X-Ca-Key:${request.headers["X-Ca-Key"]}`,
+        `X-Ca-Nonce:${request.headers["X-Ca-Nonce"]}`,
+        "X-Ca-Signature-Method:HmacSHA256",
+        `X-Ca-Timestamp:${request.headers["X-Ca-Timestamp"]}`,
+        "X-Ca-Version:1",
+        "token:main-access",
+        "/up/api/v1/user/sign/upgrade",
+      ].join("\n");
+      const expectedSignature = crypto.createHmac("sha256", "IbyhE02AwkUzvupDon3xTZ3JIeddlppP")
+        .update(stringToSign).digest("base64");
+      assert.equal(request.headers["X-Ca-Signature"], expectedSignature);
+      return { code: "success", data: { rewardEnergyNumber: 1 } };
+    }
+    if (url.pathname === "/app/energy/myEnergy") return { code: "success", data: { point: 824, incomePoint: 1024 } };
+    if (url.pathname === "/app/energy/my/growth") return { code: "success", data: {} };
+    if (url.pathname.endsWith("getTaskList")) return { code: "success", data: [] };
+    if (url.pathname.endsWith("square/index2")) return { code: "success", data: [{ articleId: "article-date-unsigned" }] };
+    if (url.pathname.endsWith("getShareCode")) return { code: "success", data: "code-date-unsigned" };
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+
+  assert.ok(signPosts >= 2, "date-unsigned retry must be attempted");
   assert.match(result.notifications[0].body, /签到成功 \| \+1 能量体/);
 }
 

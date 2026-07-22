@@ -608,6 +608,10 @@ function signRetryProfiles(profile) {
   var lowerHeaders = lowerSignatureHeaders(profile.signatureHeaders);
   var compactType = normalizedContentType(profile.contentType);
   if (!profile.contentMd5) add("Content-MD5(" + (signBodyText(profile, {}).length === 0 ? "empty" : "{}") + ")", { contentMd5: md5 });
+  if (profile.hasDateHeader) {
+    add("Date header not signed", { dateInSignature: false });
+    if (!profile.contentMd5) add("Date header not signed + Content-MD5", { dateInSignature: false, contentMd5: md5 });
+  }
   if (lowerHeaders && lowerHeaders !== profile.signatureHeaders) {
     add("lowercase X-Ca-Signature-Headers", { signatureHeaders: lowerHeaders });
     if (!profile.contentMd5) add("lowercase headers + Content-MD5", { signatureHeaders: lowerHeaders, contentMd5: md5 });
@@ -712,6 +716,7 @@ function capturedSignProfile() {
       accept: String(m.accept || "*/*"),
       contentMd5: String(m.contentMd5 || ""),
       hasDateHeader: !!m.hasDateHeader,
+      dateInSignature: m.dateInSignature !== false,
       requestBodyLength: m.requestBodyLength == null ? null : Number(m.requestBodyLength || 0),
       publicPlatform: String(m.publicPlatform || "iOS"),
       appVersion: String(m.appVersion || APP_VERSION),
@@ -758,7 +763,7 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
       accept: profile.accept,
       contentType: profile.contentType,
       contentMd5: profile.contentMd5,
-      dateHeader: requestHeaders.Date || "",
+      dateHeader: profile.dateInSignature === false ? "" : (requestHeaders.Date || ""),
       signatureHeaders: profile.signatureHeaders,
       preserveSignatureHeaderOrder: true,
       signedHeaderValues: requestHeaders,
@@ -772,8 +777,8 @@ function apiPostSign(token, body, caKey, caSecret, profile) {
   return httpPostRaw(base + path, headers, signBodyText(profile, body || {}));
 }
 
-function apiPostSignNativeSdk(token) {
-  var bodyText = "{}";
+function apiPostSignNativeSdk(token, bodyText) {
+  bodyText = bodyText == null ? "{}" : String(bodyText);
   var headers = Object.assign({}, nativeSdkSignHeaders("POST", DEFAULT_SIGN_PATH, bodyText), {
     "token": token,
     "ca_version": "1",
@@ -1230,8 +1235,12 @@ async function main() {
     }
     if (invalidSignature(sr) || unauthorizedConsumer(sr)) {
       log("签到: 当前签名被网关拒绝，尝试 LynkCoHelper 原生 SDK 签名");
-      sr = await apiPostSignNativeSdk(token);
-      log("签到原生 SDK 结果: " + safeResponseSummary(sr));
+      sr = await apiPostSignNativeSdk(token, "");
+      log("签到原生 SDK 空body结果: " + safeResponseSummary(sr));
+      if (invalidSignature(sr)) {
+        sr = await apiPostSignNativeSdk(token, "{}");
+        log("签到原生 SDK {} body结果: " + safeResponseSummary(sr));
+      }
     }
     if (isOk(sr)) {
       signResult = "签到成功";
