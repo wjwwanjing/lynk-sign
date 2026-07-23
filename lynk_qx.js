@@ -498,9 +498,94 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
+function loadCapturedSignProfile() {
+  try {
+    var raw = $prefs.valueForKey("lynk_sign_profile_v2") || "";
+    if (!raw) return null;
+    var profile = JSON.parse(raw);
+    if (profile.version !== 2 || profile.method !== "POST" ||
+        profile.host !== "app-api-gw-toc.lynkco.com" || profile.path !== SIGN_PATH ||
+        profile.supportedBody !== true || !profile.signatureHeaders) return null;
+    if (profile.xCaKey !== SIGN_CA_KEY && profile.xCaKey !== CA_KEY) return null;
+    return profile;
+  } catch (_) {
+    return null;
+  }
+}
+
+function capturedSignSecret(caKey) {
+  if (caKey === SIGN_CA_KEY) return SIGN_CA_SECRET;
+  if (caKey === CA_KEY) return CA_SECRET;
+  return "";
+}
+
+function buildCapturedSignRequest(token, profile) {
+  var secret = capturedSignSecret(profile.xCaKey);
+  if (!secret) return null;
+  var bodyText = String(profile.bodyText || "");
+  var accept = String(profile.accept || "*/*");
+  var contentType = String(profile.contentType || "application/json");
+  var contentMd5 = String(profile.contentMd5 || "");
+  var dateHeader = profile.hasDate ? new Date().toUTCString() : "";
+  var t = ts();
+  var n = nonce();
+  var methodName = String(profile.signatureMethod || "HmacSHA256");
+  var values = Object.assign({}, profile.signedValues || {}, {
+    "x-ca-key": profile.xCaKey,
+    "x-ca-nonce": n,
+    "x-ca-timestamp": t,
+    "x-ca-signature-method": methodName,
+    "token": token,
+    "authorization": "APPCODE " + APP_CODE,
+    "date": dateHeader,
+    "accept": accept,
+    "content-type": contentType,
+  });
+  var signedNames = String(profile.signatureHeaders).split(",").map(function (name) {
+    return name.trim();
+  }).filter(Boolean);
+  var canonicalHeaders = [];
+  for (var i = 0; i < signedNames.length; i++) {
+    var name = signedNames[i];
+    var value = values[name.toLowerCase()];
+    if (value == null) {
+      log("签到捕获结构缺少签名头值: " + name);
+      return null;
+    }
+    canonicalHeaders.push(name + ":" + String(value));
+  }
+  var stringToSign = ["POST", accept, contentMd5, contentType, dateHeader]
+    .concat(canonicalHeaders).concat([SIGN_PATH]).join("\n");
+  var headers = Object.assign({}, profile.passThrough || {}, {
+    "Accept": accept,
+    "Content-Type": contentType,
+    "token": token,
+    "X-Ca-Key": profile.xCaKey,
+    "X-Ca-Nonce": n,
+    "X-Ca-Timestamp": t,
+    "X-Ca-Signature-Method": methodName,
+    "X-Ca-Signature-Headers": profile.signatureHeaders,
+    "X-Ca-Signature": hmacSha256Base64(secret, stringToSign),
+  });
+  if (contentMd5) headers["Content-MD5"] = contentMd5;
+  if (dateHeader) headers.Date = dateHeader;
+  if (profile.hasAppCode) headers.Authorization = "APPCODE " + APP_CODE;
+  return { headers: headers, bodyText: bodyText };
+}
+
 // 4.2.4 签到页调用 signPut() 时不传 data，Cordova 层会将 data || {} 序列化为 "{}"。
-// 签到使用独立 Consumer，但 canonical 格式仍是网关四项 X-Ca 头；声明顺序必须与签名顺序一致。
+// 捕获过真实成功请求时严格重建原生结构；尚未捕获时保留最小默认请求用于诊断。
 function apiPostSign(token) {
+  var profile = loadCapturedSignProfile();
+  if (profile) {
+    var captured = buildCapturedSignRequest(token, profile);
+    if (captured) {
+      log("签到: 使用已捕获原生结构，X-Ca-Key=" + profile.xCaKey +
+        "，签名头=" + profile.signatureHeaders);
+      return httpPostRaw(API_BASE + SIGN_PATH, captured.headers, captured.bodyText);
+    }
+  }
+  log("签到: 未找到可用的成功捕获结构，使用默认 X-Ca-Key=" + SIGN_CA_KEY);
   var sig = hmacSign("POST", SIGN_PATH, null, SIGN_CA_KEY, SIGN_CA_SECRET);
   var headers = Object.assign({}, sig, {
     "content-type": "application/json",
@@ -672,7 +757,7 @@ async function performDailySign(token) {
     return { result: "已签到", reward: "无新增", dayInfo: dayInfo };
   }
 
-  log("签到: POST " + SIGN_PATH + "，X-Ca-Key=" + SIGN_CA_KEY + " + token + use_security=true，不带 APPCODE");
+  log("签到: POST " + SIGN_PATH + " + token + use_security=true，不带 APPCODE");
   var postResponse = await apiPostSign(token);
   if (signResponseConfirmed(postResponse)) {
     var reward = signRewardText(postResponse.data);

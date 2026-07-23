@@ -1,162 +1,106 @@
 /**
- * 领克签到请求捕获（Quantumult X response-body 重写脚本）
+ * 领克 4.2.4 签到请求结构捕获（Quantumult X）
  *
- * 目的：在领克 APP 手动点一次签到时，精确识别「真正执行签到的那条 POST」，
- * 记录复现签到所需的非敏感元数据（host / path / X-Ca-Key / 是否带 APPCODE 等），
- * 供 lynk_qx.js 自动套用。
- *
- * ⚠️ 关键判定（修复旧版误抓 /sign/info 状态探测的 bug）：
- *   只有当响应里带「签到奖励字段」(rewardEnergyNumber / rewardPointNumber /
- *   rewardSignCardNumber) 或明确的「签到成功」文案时，才认定为真实签到动作。
- *   纯状态查询 (/info、/day/info、getContinueDaysAndSignCard) 不含奖励字段，
- *   因此不会再被误当成签到 POST。
- *
- * 覆盖两个生产网关：app-api-gw-toc.lynkco.com 与 app-gateway-common.lynkco.com。
- *
- * 明确不保存 token、Authorization 值、X-Ca-Signature、nonce、timestamp、
- * 请求正文值、响应 data 值或设备标识值。
+ * 只匹配 POST /up/api/v1/user/sign/upgrade，并保存重建签名所需的结构信息。
+ * 不保存 token、Authorization、nonce、timestamp、Date 或 X-Ca-Signature 的值。
  */
 
 (function () {
   try {
     var request = $request || {};
-    var method = String(request.method || "GET").toUpperCase();
+    var method = String(request.method || "").toUpperCase();
     var url = String(request.url || "");
-    var pathMatch = url.match(/^https?:\/\/([^/]+)(\/[^?#]*)/i);
-    var host = pathMatch ? pathMatch[1] : "";
-    var path = pathMatch ? pathMatch[2] : "";
-    var query = "";
-    var queryIndex = url.indexOf("?");
-    if (queryIndex >= 0) query = url.slice(queryIndex + 1).split("#")[0];
-
-    function uniqueSorted(items) {
-      var seen = {};
-      return items.filter(function (item) {
-        item = String(item || "");
-        if (!item || seen[item]) return false;
-        seen[item] = true;
-        return true;
-      }).sort();
-    }
-
-    function jsonKeys(text) {
-      if (!text) return [];
-      try {
-        var parsed = JSON.parse(text);
-        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ?
-          Object.keys(parsed).sort() : [];
-      } catch (_) {
-        return [];
-      }
-    }
-
-    function queryKeys(text) {
-      if (!text) return [];
-      return uniqueSorted(text.split("&").map(function (part) {
-        var key = part.split("=")[0] || "";
-        try { return decodeURIComponent(key.replace(/\+/g, " ")); } catch (_) { return key; }
-      }));
-    }
-
-    var headers = request.headers || {};
-    var lowerHeaders = {};
-    Object.keys(headers).forEach(function (key) {
-      lowerHeaders[String(key).toLowerCase()] = String(headers[key]);
-    });
-    var auth = lowerHeaders.authorization || "";
-    var responseBody = ($response && $response.body) || "";
-    var responseJson = null;
-    try { responseJson = JSON.parse(responseBody); } catch (_) {}
-
-    var responseData = responseJson && responseJson.data;
-    var responseDataKeys = responseData && typeof responseData === "object" && !Array.isArray(responseData) ?
-      Object.keys(responseData).sort() : [];
-    var responseText = String(responseJson && (responseJson.message || responseJson.msg || responseJson.code) || "");
-
-    // —— 精确判定真实签到动作 ——
-    // 1) 响应带奖励字段 = 真的领到了签到奖励（状态查询绝不会有这些字段）
-    var responseHasReward = responseDataKeys.some(function (key) {
-      return /reward(?:Energy|Point|SignCard)Number/i.test(key);
-    });
-    // 2) 或响应明确说“签到成功/签到完成”
-    var responseSaysSigned = /签到成功|签到完成|sign\s*success|checkin\s*success/i.test(responseText);
-    // 明确的只读端点：即使响应偶然含 sign 字样也不当作签到动作
-    var lowerPath = path.toLowerCase();
-    var isReadEndpoint =
-      /\/(?:info|status|detail|list|query|day|summary|record|calendar|config|page|home)(?:\/|$)/.test(lowerPath) ||
-      /getcontinuedays|getsigncard|getsigninfo|day\/info|sign\/info|sign\/status/.test(lowerPath);
-
-    var isSignAction = method === "POST" && !isReadEndpoint && (responseHasReward || responseSaysSigned);
-
-    // 诊断用：user/userReward 下的其它 POST（未确认为签到动作）也单独存一份，便于排查，但不会被自动套用。
-    var isCandidatePost = method === "POST" &&
-      /\/(?:up|app)\/api\/v\d+\/(?:user|userReward)(?:\/|$)/i.test(path);
-    // 状态 GET 也留一份用于对照
-    var isSignStatus = method === "GET" && (
-      /\/user\/sign\/day\/info$/i.test(path) ||
-      /\/userReward\/getContinueDaysAndSignCard$/i.test(path)
-    );
-
-    if (!isSignAction && !isCandidatePost && !isSignStatus) {
+    var match = url.match(/^https?:\/\/([^/?#]+)(\/[^?#]*)/i);
+    var host = match ? String(match[1]).toLowerCase() : "";
+    var path = match ? match[2] : "";
+    if (method !== "POST" || path !== "/up/api/v1/user/sign/upgrade") {
       $done({});
       return;
     }
 
-    var captureType = isSignAction ? "sign-post" :
-      (isSignStatus ? "sign-status" : "sign-candidate-post");
-    var meta = {
+    var originalHeaders = request.headers || {};
+    var lowerHeaders = {};
+    Object.keys(originalHeaders).forEach(function (name) {
+      lowerHeaders[String(name).toLowerCase()] = String(originalHeaders[name]);
+    });
+
+    var bodyText = request.body == null ? "" : String(request.body);
+    var supportedBody = bodyText === "" || bodyText === "{}";
+    var signatureHeaders = lowerHeaders["x-ca-signature-headers"] || "";
+    var signedNames = signatureHeaders.split(",").map(function (name) {
+      return name.trim();
+    }).filter(Boolean);
+    var dynamic = {
+      "x-ca-key": true,
+      "x-ca-nonce": true,
+      "x-ca-timestamp": true,
+      "x-ca-signature-method": true,
+      "x-ca-signature": true,
+      "x-ca-signature-headers": true,
+      "token": true,
+      "authorization": true,
+      "date": true,
+    };
+    var signedValues = {};
+    signedNames.forEach(function (name) {
+      var lower = name.toLowerCase();
+      if (!dynamic[lower] && lowerHeaders[lower] != null) signedValues[lower] = lowerHeaders[lower];
+    });
+
+    var passThroughNames = [
+      "use_security", "risk_type", "x-ca-version", "x-ca-stage", "ca_version",
+      "x-requiretoken", "publicplatform", "user-agent", "gl_dev_id",
+      "gl_app_version", "gl_app_build", "appversioncode", "appversionname",
+    ];
+    var passThrough = {};
+    passThroughNames.forEach(function (name) {
+      if (lowerHeaders[name] != null) passThrough[name] = lowerHeaders[name];
+    });
+
+    var responseBody = ($response && $response.body) || "";
+    var responseJson = null;
+    try { responseJson = JSON.parse(responseBody); } catch (_) {}
+    var responseData = responseJson && responseJson.data;
+    var responseDataKeys = responseData && typeof responseData === "object" ? Object.keys(responseData) : [];
+    var responseConfirmed = responseJson && String(responseJson.code) === "200" && responseData &&
+      (responseData.todayFirstSign || responseDataKeys.some(function (name) {
+        return /reward(?:Energy|Point|SignCard)Number/i.test(name);
+      }));
+
+    var profile = {
+      version: 2,
       capturedAt: new Date().toISOString(),
-      captureType: captureType,
       host: host,
       path: path,
-      queryKeys: queryKeys(query),
       method: method,
       xCaKey: lowerHeaders["x-ca-key"] || "",
-      signatureHeaders: lowerHeaders["x-ca-signature-headers"] || "",
-      xCaVersion: lowerHeaders["x-ca-version"] || "",
-      xCaStage: lowerHeaders["x-ca-stage"] || "",
-      hasAppCode: /^APPCODE\s+/i.test(auth),
-      hasCepAuthentication: /^AppId=/i.test(lowerHeaders.authentication || ""),
-      hasTenantId: !!lowerHeaders.tenantid,
-      useSecurity: String(lowerHeaders.use_security || "").toLowerCase() === "true",
-      hasRiskType: !!lowerHeaders.risk_type,
-      hasToken: !!lowerHeaders.token,
-      contentType: lowerHeaders["content-type"] || "",
-      accept: lowerHeaders.accept || "",
+      signatureHeaders: signatureHeaders,
+      signatureMethod: lowerHeaders["x-ca-signature-method"] || "HmacSHA256",
+      accept: lowerHeaders.accept || "*/*",
+      contentType: lowerHeaders["content-type"] || "application/json",
       contentMd5: lowerHeaders["content-md5"] || "",
-      hasDateHeader: !!lowerHeaders.date,
-      requestBodyLength: String(request.body || "").length,
-      publicPlatform: lowerHeaders.publicplatform || "",
-      appVersion: lowerHeaders.gl_app_version || lowerHeaders.appversioncode || "",
-      appBuild: lowerHeaders.gl_app_build || lowerHeaders.appversionname || "",
-      hasUserAgent: !!lowerHeaders["user-agent"],
-      userAgent: lowerHeaders["user-agent"] || "",
-      responseHasReward: responseHasReward,
-      requestBodyKeys: jsonKeys(request.body || ""),
-      deviceHeaderNames: Object.keys(lowerHeaders).filter(function (key) {
-        return /device|gl_dev_|gl_app_|appversion|publicplatform|sweet_security/.test(key);
-      }).sort(),
-      responseStatus: ($response && ($response.status || $response.statusCode)) || "",
+      hasDate: !!lowerHeaders.date,
+      hasAppCode: /^APPCODE\s+/i.test(lowerHeaders.authorization || ""),
+      bodyText: supportedBody ? bodyText : "",
+      supportedBody: supportedBody,
+      signedValues: signedValues,
+      passThrough: passThrough,
       responseCode: responseJson && responseJson.code != null ? String(responseJson.code) : "",
-      responseMessage: responseJson && (responseJson.message || responseJson.msg) ?
-        String(responseJson.message || responseJson.msg).slice(0, 100) : "",
       responseDataKeys: responseDataKeys,
     };
 
-    var storageKey = isSignAction ? "lynk_sign_capture" :
-      (isSignStatus ? "lynk_sign_status_capture" : "lynk_sign_candidate_capture");
-    $prefs.setValueForKey(JSON.stringify(meta), storageKey);
+    if (responseConfirmed) $prefs.setValueForKey(JSON.stringify(profile), "lynk_sign_profile_v2");
     $notify(
-      isSignAction ? "领克真实签到请求已捕获 ✓" :
-        (isSignStatus ? "领克签到状态元数据已捕获" : "领克签到候选 POST 已捕获"),
-      meta.method + " " + meta.host + meta.path,
-      "X-Ca-Key=" + (meta.xCaKey || "无") + " | APPCODE=" + (meta.hasAppCode ? "有" : "无") +
-        " | 奖励字段=" + (responseHasReward ? "有" : "无") +
-        " | APP=" + (meta.appVersion || "未知") +
-        " | HTTP=" + (meta.responseStatus || "未知")
+      responseConfirmed ? "领克签到结构已捕获" : "领克签到请求未采用",
+      "X-Ca-Key=" + (profile.xCaKey || "无") + " | body=" + (bodyText === "" ? "空" : bodyText),
+      "签名头=" + (signatureHeaders || "无") +
+        " | Date=" + (profile.hasDate ? "有" : "无") +
+        " | MD5=" + (profile.contentMd5 ? "有" : "无") +
+        " | response=" + (profile.responseCode || "未知") +
+        (responseConfirmed ? "" : " | 仅成功签到才保存")
     );
   } catch (_) {
-    // 诊断脚本不能影响领克 APP 原始响应。
+    // 捕获失败不能影响 APP 原请求。
   }
   $done({});
 })();

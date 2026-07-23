@@ -206,6 +206,7 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 - **签到流程（来自 4.2.4 APK 内置 H5）**：先请求 `GET /up/api/v1/user/sign/day/info`，只有 `data.signStatus === 1` 才视为今日已签；未签时调用一次 `POST /up/api/v1/user/sign/upgrade`，请求带 `token` 和 `use_security: true`，不带 APPCODE。页面调用时 data 未定义，Cordova 网络层会按 `JSON.stringify(data || {})` 发送 `{}`。
 - **签到签名**：`apiHostEnable=true` 会绕过普通 H5 Consumer，交给 `SWNetworkPlugin` 原生桥接。普通状态/分享接口使用 `204644386`；签到使用独立的 `203760416` Consumer。签到仍按四项 `X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp` 构造 canonical string，并保证声明顺序与实际签名顺序完全一致；不加入 `Date` 或 `Content-MD5`。
 - **成功判定**：直接响应必须同时满足 `code === "200"` 和 `data.todayFirstSign` 为真；否则只复查一次 `day/info`，复查到 `signStatus === 1` 才确认成功。本地日期缓存永远不会覆盖服务端的未签到状态。
+- **原生签名一次性校准**：iOS 原生插件可能追加版本、token 或设备签名头。刷新 `lynk_rewrite.conf` 后，在领克 APP 手动点一次签到，`lynk_sign_capture.js` 会只在签到真实成功时把签名头集合和非敏感结构保存到 QX 本地 `lynk_sign_profile_v2`。之后定时脚本优先按该结构动态重建；不会保存 token、nonce、timestamp、Date 或原始签名值。
 - **重试机制**：若 `getShareCode` 返回风控拦截（`share.need.validate.check`），等 3 秒重试 1 次（风控有短窗口限流）
 - **文章与分享码保持一致**：社区文章、风险头里的 H5 URL、`businessNo`、最终通知链接使用同一个文章 ID；不会再出现“最新文章取码、固定文章上报”的混用。
 - **成功判定**：接口成功只代表“上报已受理”。分享奖励是“能量体”，脚本会比较主账号 `/app/energy/my/growth` 中 `accountLevelVo.growth` 的前后差值；`/app/energy/myEnergy.data.point` 是 Co积分，不再用于核验分享奖励。
@@ -259,7 +260,8 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 2. 最常见原因是 refreshToken 过期，重新抓包
 3. 如果提示"已签到"说明之前已经签过了，正常
 4. 日志应显示 `/up/api/v1/user/sign/upgrade + X-Ca-Key=203760416 + use_security=true + 无 APPCODE`；`204644386` 调这个端点会返回 `Unauthorized Consumer`
-5. `接口未确认签到` 会同时记录 POST 响应和 `day/info` 复查摘要；摘要已脱敏，可据其中的 `code/http/message/dataKeys` 定位问题
+5. 若仍是 `Invalid Signature`，刷新远程重写模块，在领克 APP 手动点一次签到；看到“领克签到结构已捕获”通知后，后续日志应出现“使用已捕获原生结构”
+6. `接口未确认签到` 会同时记录 POST 响应和 `day/info` 复查摘要；摘要已脱敏，可据其中的 `code/http/message/dataKeys` 定位问题
 
 **脚本怎么调试？**
 QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.log 输出。
@@ -284,6 +286,7 @@ QX → 工具箱 → 脚本 → 选脚本 → 运行，底部可以看 console.l
 |------|------|
 | `lynk_qx.js` | QX 定时脚本（当前使用） |
 | `lynk_token.js` | QX 重写脚本，自动拦截登录/刷新响应并保存 Token（免手动抓包） |
+| `lynk_sign_capture.js` | 一次性捕获成功签到的原生签名结构，不保存动态凭据 |
 | `lynk_share_capture.js` | 捕获分享风控头和 shareCode |
 | `lynk_rewrite.conf` | QX 远程重写模块，供 `[rewrite_remote]` 一行订阅（含拦截规则 + hostname） |
 | `tests/` | 仅用于电脑端回归测试，QX 运行不需要，可不部署到手机 |
