@@ -77,8 +77,12 @@ const OAUTH_BASE = "https://app-services.lynkco.com.cn";
 const CA_KEY     = "204644386";
 const CA_SECRET  = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 const APP_CODE   = "3fa3314998bd4195a9fe2df3e85e6a12";
-// 4.2.4 H5/Cordova SDK 的固定签名头顺序。
+// 普通 H5/状态/分享接口使用的签名头顺序。
 const SIG_HDRS   = "X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp";
+// Cordova 的 SWNetworkPlugin 对签到接口使用独立的原生 Consumer。
+const SIGN_CA_KEY = "203760416";
+const SIGN_CA_SECRET = "IbyhE02AwkUzvupDon3xTZ3JIeddlppP";
+const SIGN_EMPTY_JSON_MD5 = "mZFLkyvTelC5g8XnyQrpOw==";
 const APP_VERSION      = "4.2.4";   // APP 版本号（与 doRefresh 一致）
 const APP_VERSION_CODE = "40204067"; // APP build 号（来自 4.2.4 IPA）
 const SHARE_H5_BASE = "https://h5.lynkco.com";
@@ -495,14 +499,49 @@ function apiPost(path, token, body, params, extraHeaders) {
   return httpPost(bs.url, headers, body || {});
 }
 
+// 原生 SWNetworkPlugin 的签到签名：与 H5 的 204644386 Consumer 不同，
+// 使用 203760416、Date、空 JSON 的 Content-MD5 以及原生 SDK 的三项签名头。
+function nativeSignHeaders(bodyText) {
+  var accept = "application/json; charset=utf-8";
+  var contentType = "application/json; charset=utf-8";
+  var contentMd5 = bodyText ? SIGN_EMPTY_JSON_MD5 : "";
+  var dateHeader = new Date().toUTCString();
+  var n = nonce().toLowerCase();
+  var t = ts();
+  var stringToSign = [
+    "POST",
+    accept,
+    contentMd5,
+    contentType,
+    dateHeader,
+    "x-ca-key:" + SIGN_CA_KEY,
+    "x-ca-nonce:" + n,
+    "x-ca-timestamp:" + t,
+    SIGN_PATH,
+  ].join("\n");
+  return {
+    "x-ca-key": SIGN_CA_KEY,
+    "x-ca-nonce": n,
+    "x-ca-timestamp": t,
+    "x-ca-signature-headers": "x-ca-nonce,x-ca-key,x-ca-timestamp",
+    "x-ca-signature": hmacSha256Base64(SIGN_CA_SECRET, stringToSign),
+    "date": dateHeader,
+    "accept": accept,
+    "content-type": contentType,
+    "content-md5": contentMd5,
+  };
+}
+
 // 4.2.4 签到页调用 signPut() 时不传 data，Cordova 层会将 data || {} 序列化为 "{}"。
-// 请求显式增加 use_security，使用生产 Consumer，不带 APPCODE，也不做签名变体重试。
+// 请求显式增加 use_security，使用原生 Consumer，不带 APPCODE，也不做签名变体重试。
 function apiPostSign(token) {
-  var sig = hmacSign("POST", SIGN_PATH, null, CA_KEY, CA_SECRET);
+  var sig = nativeSignHeaders("{}");
   var headers = Object.assign({}, sig, {
-    "content-type": "application/json",
     "token": token,
     "use_security": "true",
+    "ca_version": "1",
+    "x-requiretoken": "false",
+    "User-Agent": "ALIYUN-ANDROID-UA",
   });
   return httpPostRaw(API_BASE + SIGN_PATH, headers, "{}");
 }
@@ -669,7 +708,7 @@ async function performDailySign(token) {
     return { result: "已签到", reward: "无新增", dayInfo: dayInfo };
   }
 
-  log("签到: POST " + SIGN_PATH + "，X-Ca-Key=" + CA_KEY + " + token + use_security=true，不带 APPCODE");
+  log("签到: POST " + SIGN_PATH + "，原生 X-Ca-Key=" + SIGN_CA_KEY + " + token + use_security=true，不带 APPCODE");
   var postResponse = await apiPostSign(token);
   if (signResponseConfirmed(postResponse)) {
     var reward = signRewardText(postResponse.data);
