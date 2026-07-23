@@ -262,15 +262,6 @@ function safeResponseSummary(resp) {
   return parts.join(" ");
 }
 
-function localDateKey() {
-  var now = new Date();
-  return now.getFullYear() + "-" + pad2(now.getMonth() + 1) + "-" + pad2(now.getDate());
-}
-
-function rememberSignedToday() {
-  $prefs.setValueForKey(localDateKey(), "lynk_last_sign_date");
-}
-
 function ts() { return String(Date.now()); }
 
 function nonce() {
@@ -506,22 +497,15 @@ function loadCapturedSignProfile() {
     if (profile.version !== 2 || profile.method !== "POST" ||
         profile.host !== "app-api-gw-toc.lynkco.com" || profile.path !== SIGN_PATH ||
         profile.supportedBody !== true || !profile.signatureHeaders) return null;
-    if (profile.xCaKey !== SIGN_CA_KEY && profile.xCaKey !== CA_KEY) return null;
+    if (profile.xCaKey !== SIGN_CA_KEY) return null;
     return profile;
   } catch (_) {
     return null;
   }
 }
 
-function capturedSignSecret(caKey) {
-  if (caKey === SIGN_CA_KEY) return SIGN_CA_SECRET;
-  if (caKey === CA_KEY) return CA_SECRET;
-  return "";
-}
-
 function buildCapturedSignRequest(token, profile) {
-  var secret = capturedSignSecret(profile.xCaKey);
-  if (!secret) return null;
+  if (profile.xCaKey !== SIGN_CA_KEY) return null;
   var bodyText = String(profile.bodyText || "");
   var accept = String(profile.accept || "*/*");
   var contentType = String(profile.contentType || "application/json");
@@ -565,7 +549,7 @@ function buildCapturedSignRequest(token, profile) {
     "X-Ca-Timestamp": t,
     "X-Ca-Signature-Method": methodName,
     "X-Ca-Signature-Headers": profile.signatureHeaders,
-    "X-Ca-Signature": hmacSha256Base64(secret, stringToSign),
+    "X-Ca-Signature": hmacSha256Base64(SIGN_CA_SECRET, stringToSign),
   });
   if (contentMd5) headers["Content-MD5"] = contentMd5;
   if (dateHeader) headers.Date = dateHeader;
@@ -573,7 +557,7 @@ function buildCapturedSignRequest(token, profile) {
   return { headers: headers, bodyText: bodyText };
 }
 
-// 4.2.4 签到页调用 signPut() 时不传 data，Cordova 层会将 data || {} 序列化为 "{}"。
+// 4.2.4 签到页调用 signPut() 时不传 data；成功原生请求实抓 body 为空。
 // 捕获过真实成功请求时严格重建原生结构；尚未捕获时保留最小默认请求用于诊断。
 function apiPostSign(token) {
   var profile = loadCapturedSignProfile();
@@ -741,6 +725,13 @@ function signRewardText(data) {
 }
 
 async function performDailySign(token) {
+  var signProfile = loadCapturedSignProfile();
+  if (signProfile) {
+    log("签到签名结构: 已校准，Key=" + signProfile.xCaKey +
+      "，Date=" + (signProfile.hasDate ? "有" : "无") +
+      "，MD5=" + (signProfile.contentMd5 ? "有" : "无") +
+      "，body=" + (signProfile.bodyText === "" ? "空" : signProfile.bodyText));
+  }
   var dayInfo = await apiGetTokenOnly("/up/api/v1/user/sign/day/info", token);
   log("签到日状态: " + safeResponseSummary(dayInfo));
   if (!isOk(dayInfo) || !dayInfo.data || dayInfo.data.signStatus == null) {
@@ -752,7 +743,6 @@ async function performDailySign(token) {
   }
 
   if (signedStatusFromDayInfo(dayInfo)) {
-    rememberSignedToday();
     log("今日已签到 (day/info确认)");
     return { result: "已签到", reward: "无新增", dayInfo: dayInfo };
   }
@@ -761,7 +751,6 @@ async function performDailySign(token) {
   var postResponse = await apiPostSign(token);
   if (signResponseConfirmed(postResponse)) {
     var reward = signRewardText(postResponse.data);
-    rememberSignedToday();
     log("签到成功: " + reward);
     return {
       result: "签到成功",
@@ -774,7 +763,6 @@ async function performDailySign(token) {
   await waitSeconds(1);
   var recheck = await apiGetTokenOnly("/up/api/v1/user/sign/day/info", token);
   if (signedStatusFromDayInfo(recheck)) {
-    rememberSignedToday();
     log("签到响应未直接确认，但 day/info 复查已签到: " + safeResponseSummary(postResponse));
     return {
       result: "签到成功",

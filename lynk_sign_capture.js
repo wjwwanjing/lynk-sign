@@ -41,10 +41,23 @@
       "authorization": true,
       "date": true,
     };
+    // 只允许已确认可安全重建的静态签名头；设备指纹等未知头不落盘。
+    var allowedStaticSigned = {
+      "x-ca-version": true,
+      "x-ca-stage": true,
+      "ca_version": true,
+    };
     var signedValues = {};
+    var unsupportedSignedHeaders = [];
     signedNames.forEach(function (name) {
       var lower = name.toLowerCase();
-      if (!dynamic[lower] && lowerHeaders[lower] != null) signedValues[lower] = lowerHeaders[lower];
+      if (!dynamic[lower]) {
+        if (allowedStaticSigned[lower] && lowerHeaders[lower] != null) {
+          signedValues[lower] = lowerHeaders[lower];
+        } else {
+          unsupportedSignedHeaders.push(name);
+        }
+      }
     });
 
     var passThroughNames = [
@@ -62,7 +75,8 @@
     try { responseJson = JSON.parse(responseBody); } catch (_) {}
     var responseData = responseJson && responseJson.data;
     var responseDataKeys = responseData && typeof responseData === "object" ? Object.keys(responseData) : [];
-    var responseConfirmed = responseJson && String(responseJson.code) === "200" && responseData &&
+    var replayableStructure = supportedBody && unsupportedSignedHeaders.length === 0;
+    var responseConfirmed = replayableStructure && responseJson && String(responseJson.code) === "200" && responseData &&
       (responseData.todayFirstSign || responseDataKeys.some(function (name) {
         return /reward(?:Energy|Point|SignCard)Number/i.test(name);
       }));
@@ -83,6 +97,8 @@
       hasAppCode: /^APPCODE\s+/i.test(lowerHeaders.authorization || ""),
       bodyText: supportedBody ? bodyText : "",
       supportedBody: supportedBody,
+      replayableStructure: replayableStructure,
+      unsupportedSignedHeaders: unsupportedSignedHeaders,
       signedValues: signedValues,
       passThrough: passThrough,
       responseCode: responseJson && responseJson.code != null ? String(responseJson.code) : "",
@@ -97,6 +113,7 @@
         " | Date=" + (profile.hasDate ? "有" : "无") +
         " | MD5=" + (profile.contentMd5 ? "有" : "无") +
         " | response=" + (profile.responseCode || "未知") +
+        (unsupportedSignedHeaders.length ? " | 未知签名头=" + unsupportedSignedHeaders.join(",") : "") +
         (responseConfirmed ? "" : " | 仅成功签到才保存")
     );
   } catch (_) {

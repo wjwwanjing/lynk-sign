@@ -203,10 +203,10 @@ POST /app/v1/task/shareReporting?shareCode=<code> {businessNo, eventData}  # 4. 
 
 - **businessNo** 来源：优先从社区信息流 `square/index2` 取第一篇真实文章 ID；取不到才回退到配置的 `lynk_share_cid`。用真实文章而非固定 ID，更贴近官方 APP 行为。
 - **shareReporting 不带 token，但不能省略 APPCODE**：`xbgo/lynkco-daily` 的请求构造器即使在 `token_required=False` 时仍保留 `Authorization: APPCODE ...`。旧 QX 版把这两个头一起删掉，是点击回调不能正常记账的主要问题。
-- **签到流程（来自 4.2.4 APK 内置 H5）**：先请求 `GET /up/api/v1/user/sign/day/info`，只有 `data.signStatus === 1` 才视为今日已签；未签时调用一次 `POST /up/api/v1/user/sign/upgrade`，请求带 `token` 和 `use_security: true`，不带 APPCODE。页面调用时 data 未定义，Cordova 网络层会按 `JSON.stringify(data || {})` 发送 `{}`。
-- **签到签名**：`apiHostEnable=true` 会绕过普通 H5 Consumer，交给 `SWNetworkPlugin` 原生桥接。普通状态/分享接口使用 `204644386`；签到使用独立的 `203760416` Consumer。签到仍按四项 `X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp` 构造 canonical string，并保证声明顺序与实际签名顺序完全一致；不加入 `Date` 或 `Content-MD5`。
+- **签到流程（来自 4.2.4 APK 内置 H5）**：先请求 `GET /up/api/v1/user/sign/day/info`，只有 `data.signStatus === 1` 才视为今日已签；未签时调用一次 `POST /up/api/v1/user/sign/upgrade`，请求带 `token` 和 `use_security: true`，不带 APPCODE。页面调用时 data 未定义，成功原生请求实抓 body 为空。
+- **签到签名（成功请求实抓确认）**：`apiHostEnable=true` 会绕过普通 H5 Consumer，交给 `SWNetworkPlugin` 原生桥接。普通状态/分享接口使用 `204644386`；签到使用独立的 `203760416` Consumer。原生请求包含 `Date`、不含 `Content-MD5`，并按 `X-Ca-Key,X-Ca-Nonce,X-Ca-Signature-Method,X-Ca-Timestamp,X-Ca-Version,token` 的顺序签名。`Date` 进入 canonical string 的标准 Date 槽位，`X-Ca-Version` 和当前 accessToken 进入签名头区。
 - **成功判定**：直接响应必须同时满足 `code === "200"` 和 `data.todayFirstSign` 为真；否则只复查一次 `day/info`，复查到 `signStatus === 1` 才确认成功。本地日期缓存永远不会覆盖服务端的未签到状态。
-- **原生签名一次性校准**：iOS 原生插件可能追加版本、token 或设备签名头。刷新 `lynk_rewrite.conf` 后，在领克 APP 手动点一次签到，`lynk_sign_capture.js` 会只在签到真实成功时把签名头集合和非敏感结构保存到 QX 本地 `lynk_sign_profile_v2`。之后定时脚本优先按该结构动态重建；不会保存 token、nonce、timestamp、Date 或原始签名值。
+- **原生签名一次性校准**：刷新 `lynk_rewrite.conf` 后，在领克 APP 手动点一次签到，`lynk_sign_capture.js` 会只在签到真实成功时把签名头集合和非敏感结构保存到 QX 本地 `lynk_sign_profile_v2`。之后定时脚本按该结构动态生成新的 Date、nonce、timestamp 和签名，并注入当前 accessToken；不会保存 token、Authorization、nonce、timestamp、Date 或原始签名值。日志出现“签到签名结构: 已校准”即表示定时脚本已读到它。
 - **重试机制**：若 `getShareCode` 返回风控拦截（`share.need.validate.check`），等 3 秒重试 1 次（风控有短窗口限流）
 - **文章与分享码保持一致**：社区文章、风险头里的 H5 URL、`businessNo`、最终通知链接使用同一个文章 ID；不会再出现“最新文章取码、固定文章上报”的混用。
 - **成功判定**：接口成功只代表“上报已受理”。分享奖励是“能量体”，脚本会比较主账号 `/app/energy/my/growth` 中 `accountLevelVo.growth` 的前后差值；`/app/energy/myEnergy.data.point` 是 Co积分，不再用于核验分享奖励。
